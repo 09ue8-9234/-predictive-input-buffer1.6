@@ -1,4 +1,4 @@
-// Click Before Frames v2.9 (cube-style wave, wave auto-release, orb alignment, full ghost state, drift check, in-game console on F9)
+// Testing (id abhyu.input-buffer) v2.87.1: Click Before Frames engine, no in-game UI. All settings live in config.json (cfg.hpp) and are driven from an external console over a named pipe.
 //
 // When you click (or release, in wave / robot), a hidden "ghost" player is simulated
 // ahead with your input. If the ghost dies, the input is retried with 1..N ticks of
@@ -6,24 +6,23 @@
 // and delivered that many physics ticks later. 1 tick = 1/240 s = 0.25 frames @ 60fps.
 //
 // v2 changes:
-//  - Bigger windows: F6 stages up to 32 ticks (8 frames) plus a CUSTOM stage (settings).
+//  - Bigger windows: F6 stages up to 32 ticks (8 frames) plus four named CUSTOM slots A-D (settings, up to 128 ticks).
 //  - Smart prediction: ghost uses orbs, pads, gravity portals and speed portals; mode /
 //    size / dual / mirror / teleport portals end the prediction as "safe".
 //  - Input queue: every input arriving during a delay is shifted by the same amount,
 //    so taps and hold lengths are preserved (no more swallowed clicks / 1-tick taps).
 //  - Time budget per click so big windows don't hitch.
 //  - Fixes: ghost lifetime, init using `this`, time-warp dt, F6 only when GD focused,
-//    dead flipGravity hook priority, optional console, in-game console (stage + live log, hidden by default).
+//    dead flipGravity hook priority, optional console.
 
 #include <Geode/Geode.hpp>
+#include <Geode/modify/MenuLayer.hpp>
 #include <Geode/utils/web.hpp>
 #include <Geode/modify/EffectGameObject.hpp>
 #include <Geode/modify/GJBaseGameLayer.hpp>
 #include <Geode/modify/GameObject.hpp>
 #include <Geode/modify/HardStreak.hpp>
 #include <Geode/modify/LevelEditorLayer.hpp>
-#include <Geode/modify/MenuLayer.hpp>
-#include <Geode/ui/TextInput.hpp>
 #include <Geode/modify/PlayLayer.hpp>
 #include <Geode/modify/PauseLayer.hpp>
 #include <Geode/modify/EndLevelLayer.hpp>
@@ -32,20 +31,24 @@
 #include <map>
 #include <Geode/modify/PlayerObject.hpp>
 #include <Geode/modify/RingObject.hpp>
+#include <Geode/modify/CCScheduler.hpp>
+#include "cfg.hpp"
+#include <atomic>
 #ifdef GEODE_IS_WINDOWS
 #include <Windows.h>
 #endif
-#include <ctime>
 #include <algorithm>
-#include <array>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <cctype>
 #include <climits>
 #include <cmath>
 #include <complex>
+#include <condition_variable>
 #include <deque>
+#include <mutex>
 #include <filesystem>
 #include <functional>
 #include <fstream>
@@ -60,7 +63,6 @@ using namespace geode::prelude;
 namespace {
     constexpr int HOOK_PRIORITY = -1000000;
     constexpr float TICK = 0.25f;
-    constexpr size_t PANEL_LINES = 8;
     constexpr int SPIDER_LAND = 12;  // v2.15: ticks on a surface after a spider input = safe
 
     constexpr uint64_t typeBit(GameObjectType type) {
@@ -84,15 +86,24 @@ namespace {
         typeBit(GameObjectType::InverseGravityPortal) | typeBit(GameObjectType::NormalGravityPortal) |
         typeBit(GameObjectType::GravityTogglePortal);
 
-    // Portals that change too much state to simulate: reaching one ends prediction as "safe".
+    // Portals that end a prediction as "safe" when the ghost reaches one. Since v2.79 the mode portals
+    // among them (MODE_TYPES) are simulated instead when "Predict through portals" is on; dual, solo and
+    // teleport portals and teleport orbs always end it.
     constexpr uint64_t STOP_TYPES =
         typeBit(GameObjectType::ShipPortal) | typeBit(GameObjectType::CubePortal) | typeBit(GameObjectType::BallPortal) |
         typeBit(GameObjectType::UfoPortal) | typeBit(GameObjectType::WavePortal) | typeBit(GameObjectType::RobotPortal) |
         typeBit(GameObjectType::SpiderPortal) | typeBit(GameObjectType::SwingPortal) | typeBit(GameObjectType::DualPortal) |
         typeBit(GameObjectType::SoloPortal) | typeBit(GameObjectType::TeleportPortal) | typeBit(GameObjectType::TeleportOrb);
 
+    // v2.79: with "Predict through portals" these switch the ghost's mode instead of
+    // ending the prediction (dual / solo / teleport still end it).
+    constexpr uint64_t MODE_TYPES =
+        typeBit(GameObjectType::ShipPortal) | typeBit(GameObjectType::CubePortal) | typeBit(GameObjectType::BallPortal) |
+        typeBit(GameObjectType::UfoPortal) | typeBit(GameObjectType::WavePortal) | typeBit(GameObjectType::RobotPortal) |
+        typeBit(GameObjectType::SpiderPortal) | typeBit(GameObjectType::SwingPortal);
+
     // v2.8: size portals are applied to the ghost instead of ending the prediction.
-    // (Mirror portals only flip the screen, so the ghost simply ignores them.)
+    // (Mirror portals are assumed to only flip the screen, so the ghost ignores them. Not verified.)
     constexpr uint64_t SIZE_TYPES = typeBit(GameObjectType::RegularSizePortal) | typeBit(GameObjectType::MiniSizePortal);
 
     bool hasType(uint64_t mask, GameObject* object) {
@@ -116,28 +127,51 @@ namespace {
         int ticksAll;
         int ticksWave;
         bool custom;
+        int slot;  // custom slot 0..3 (A-D), -1 for the fixed stages
     };
 
+    // v2.87.1: one tick = 0.25 frame (240 steps/s), so the smallest window is 1 tick = 0.25f.
     constexpr Stage STAGES[] = {
-        { true, 2, 2, false },
-        { true, 4, 4, false },
-        { true, 8, 8, false },
-        { true, 16, 8, false },
-        { true, 24, 12, false },
-        { true, 32, 16, false },
-        { true, 0, 0, true },
-        { false, 0, 0, false },
+        { true, 1, 1, false, -1 },    // 0: 0.25f (1 tick, wave 1 tick)
+        { true, 2, 2, false, -1 },    // 1: 0.5f
+        { true, 4, 4, false, -1 },    // 2: 1f
+        { true, 8, 8, false, -1 },    // 3: 2f
+        { true, 16, 8, false, -1 },   // 4: 4f, wave 2f
+        { true, 24, 12, false, -1 },  // 5: 6f, wave 3f
+        { true, 32, 16, false, -1 },  // 6: 8f, wave 4f
+        { true, 0, 0, true, 0 },      // 7: custom slot A (keys custom-ticks / custom-wave-ticks, as before)
+        { true, 0, 0, true, 1 },      // 8: custom slot B
+        { true, 0, 0, true, 2 },      // 9: custom slot C
+        { true, 0, 0, true, 3 },      // 10: custom slot D
+        { false, 0, 0, false, -1 },   // 11: off
     };
     constexpr int STAGE_COUNT = sizeof(STAGES) / sizeof(STAGES[0]);
+    static_assert(STAGE_COUNT - 1 == cfg::STAGE_MAX, "STAGES table and cfg::STAGE_MAX must agree");
+    // Named stage numbers: no bare literal stage numbers anywhere else in this file.
+    constexpr int STAGE_025F = 0;
+    constexpr int STAGE_05F = 1;
+    constexpr int STAGE_1F = 2;
+    constexpr int STAGE_2F = 3;
+    constexpr int STAGE_4F = 4;
+    constexpr int STAGE_6F = 5;
+    constexpr int STAGE_8F = 6;
+    constexpr int FIRST_CUSTOM_STAGE = 7;
+    constexpr int CUSTOM_SLOTS = 4;
+    constexpr int STAGE_OFF = STAGE_COUNT - 1;
+    static_assert(STAGES[STAGE_025F].ticksAll == 1 && STAGES[STAGE_05F].ticksAll == 2 && STAGES[STAGE_1F].ticksAll == 4 && STAGES[STAGE_2F].ticksAll == 8 &&
+                  STAGES[STAGE_4F].ticksAll == 16 && STAGES[STAGE_4F].ticksWave == 8 && STAGES[STAGE_6F].ticksAll == 24 && STAGES[STAGE_8F].ticksAll == 32,
+        "stage names and the STAGES table must agree");
+    static_assert(STAGES[FIRST_CUSTOM_STAGE].custom && STAGES[FIRST_CUSTOM_STAGE + CUSTOM_SLOTS - 1].custom && !STAGES[STAGE_OFF].enabled &&
+                  FIRST_CUSTOM_STAGE + CUSTOM_SLOTS == STAGE_OFF && !STAGES[FIRST_CUSTOM_STAGE - 1].custom,
+        "custom slots sit right before the off stage");
+    static_assert(cfg::STAGE_DEFAULT == STAGE_05F, "a fresh install starts on 0.5f");
+    constexpr char const* CUSTOM_TICKS_KEY[CUSTOM_SLOTS] = { "custom-ticks", "custom-b-ticks", "custom-c-ticks", "custom-d-ticks" };
+    constexpr char const* CUSTOM_WAVE_KEY[CUSTOM_SLOTS] = { "custom-wave-ticks", "custom-b-wave-ticks", "custom-c-wave-ticks", "custom-d-wave-ticks" };
+    constexpr char const* CUSTOM_NAME_KEY[CUSTOM_SLOTS] = { "custom-name", "custom-b-name", "custom-c-name", "custom-d-name" };
 
     struct QueuedInput {
         int ticksLeft;
         bool down;
-        // v2.85 no-hitch: not an input yet, the search for it goes on when it comes due
-        bool resume = false;
-        int from = 0;      // first delay (from then) not tried yet
-        int elapsed = 0;   // ticks since your click
-        int resumes = 0;
     };
 
     struct ObjSnapshot {
@@ -147,7 +181,6 @@ namespace {
         bool activated;
         bool byP1;
         bool byP2;
-        bool animated = false;  // v2.84.6: m_animationTriggered (a pad's animation played)
     };
 
     struct Buffer {
@@ -156,35 +189,21 @@ namespace {
         CCLayer* ghostLayer = nullptr;
         unsigned ghostLayerBase = 0;  // v2.24: children the ghost layer has right after the ghosts are made
 
-        CCNode* panel = nullptr;
-        CCLabelBMFont* panelTitle = nullptr;               // current stage
-        std::vector<CCLabelBMFont*> panelLines;            // one label per log line (colored)
-        bool panelOpen = false;  // closed by default, remembered for the session
-        bool panelDirty = false; // v2.71: new log lines, the panel is redrawn once on the next step
         bool perfMode = false;   // v2.71: performance mode
         double userBudget = 6.0; // v2.75: the budget from the settings (budgetMs is this click's)
         bool autoBudget = true;  // v2.75: budget follows the frame rate
         std::unordered_set<GameObject*> simDisabled;  // v2.75: objects a toggle orb switched off in this prediction
-        std::deque<std::string> logLines;
 
         bool simulating = false;
         bool injecting = false;
         bool ghostDied = false;
         bool ghostHitPortal = false;
-        bool portalPredict = true;    // v2.79: the ghost takes mode portals instead of stopping there
-        bool ghostSwitched = false;   // v2.79: the ghost changed mode through a portal in this run
-        bool lastRunSwitched = false; // v2.83: the last finished run went through a mode portal
-        bool ghostSolo = false;       // v2.84: a dual ghost went through a solo portal (only P1 goes on)
-        bool simSecond = false;       // v2.85: ghost 2 is being simulated (dual from the start, or after a dual portal)
-        bool noHitch = true;          // v2.85: a search that ran out of time goes on next tick
-        std::vector<GameObject*> simEnabled;  // v2.85: switched-off objects a toggle switched on in this prediction
-        bool nextClick = true;        // v2.83: plan two clicks ahead
         bool realInput = false;
         bool appliedInput = false;
         bool isPlayer1 = true;
 
         bool enabled = true;
-        int stage = 0;
+        int stage = STAGE_05F;  // v2.87.1: 0.5f (was 0 before the 0.25f stage was added in front)
         int ticksAll = 2;
         int ticksWave = 2;
 
@@ -220,21 +239,37 @@ namespace {
         bool autoRelease = false;    // v2.4: wave auto-release (practice mode only)
         int autoWindow = 6;          // v2.4: hold must die within this many ticks to auto-release
         bool autoReleased = false;   // v2.4: we released for you; your real release is swallowed
-        bool autoClick = false;      // v2.80: click for you at the last moment when you didn't
-        bool autoClicked = false;    // v2.80: we clicked for you; your own late click is swallowed
-        int autoClickTick = 0;       // v2.80: when that was
+        bool autoClick = false;      // v2.79: click for you when idling dies and a click is fully safe
+        bool autoClicked = false;    // v2.79: we clicked for you; your own click right after is swallowed
+        bool swallowRelease = false; // v2.79: the release of that swallowed click is swallowed too
+        int autoClickAge = 0;        // v2.79: ticks since the auto click
+        int spamStreak = 3;          // v2.79: fast inputs in a row that count as spam (setting)
+        bool portalPredict = true;   // v2.79: ghosts switch mode at mode portals instead of stopping
+        bool ghostSwitched = false;  // v2.79: the ghost changed mode through a portal in this run
+        int tps = 240;               // v2.79: physics steps per second (setting)
         PlayLayer* owner = nullptr;  // v2.86: the level the mod has set up (null while one loads)
+        bool haveStartRects = false; // v2.79: realRect1/2 hold where you are as this prediction starts (portal check)
         int spamGap = 16;            // v2.5.2: inputs closer than this (ticks) count toward wave spam
-        int spamStreak = 3;          // v2.58: this many fast inputs in a row = spam (was fixed at 3)
         bool waveMargin = true;      // v2.10: center wave saves in the safe window (1 tick of room)
         bool waveV46 = false;        // v2.7: use the old v4.6 wave rules instead of the cube-style ones
         bool orbAlign = true;        // v2.6: hold an early press back until the ghost is inside the orb
         bool orbAlignGround = false; // v2.11.1: also align presses made on the ground (jumps)
         bool ignoreTouching = true;  // v2.31: hazards you touch right now without dying can't kill the ghost
         bool haveRealRect = false;
-        bool haveStartRects = false;  // v2.78.1: realRect1/2 hold where you are as this prediction starts (portal check)
         CCRect realRect1, realRect2;  // your hitboxes when the prediction starts
         std::unordered_set<GameObject*> harmless;  // hazards on you at the start of this prediction
+        std::unordered_set<GameObject*> harmless2;  // v2.87.1 (fix-dual-harmless): the same for P2's ghost
+        // v2.87.1 fix toggles (see the fix-* settings): fixRestart is on by default, the others are off
+        bool fixRestart = true;
+        bool fixDualHarmless = false;
+        bool fixLowLatQueue = false;
+        bool fixPracticeQueue = false;
+        bool fixGroupOn = false;
+        bool fixOrbChecks = false;
+        bool fixMoreTimeChecks = false;
+        bool fixTrainingAuto = false;
+        bool fixMoverConflict = false;
+        bool fixAutoThrottle = false;
         int baseEscape = -1;         // v2.36: press-now run only survives if you react by this tick
         int baseCrash = -1;          // v2.36: ...otherwise it crashes here
         bool lowLatency = false;     // v2.35: never chain delays, small budget and max delay
@@ -251,15 +286,9 @@ namespace {
         float ghostShiftX = 0.f;     // v2.28: horizontal offset applied to the ghost's start
         int lateCrash = 90;          // v2.27: cube / ball crashes after this many ticks aren't this click's (0 = off)
         bool predictMovers = false;  // v2.27: move objects along their current motion during predictions
-        bool predictTriggers = true; // v2.81: objects that a move trigger ahead will start moving
-        int triggersAhead = 0;       // v2.81: move triggers the last prediction looked at (explain log)
         bool shipBuffer = false;     // v2.25: buffer ship inputs too
         int shipSpamGap = 6;         // v2.44: ship feathering is normal control, only taps closer than this are spam
         int shipMaxDelay = 2;        // v2.25: ship's own max delay (240/s ticks)
-        // v2.88 per-mode frames (menu's Custom tab): each game mode's own max delay, in 240/s
-        // ticks, used instead of the stage's when on. Order: MODE_NAMES.
-        bool perMode = false;
-        std::array<int, 8> modeTicks { 40, 4, 40, 40, 20, 40, 40, 40 };
         bool perfLog = false;        // v2.21: log time / runs / ghost ticks per click
         int simRuns = 0;             // v2.21: predictions run for the current click
         long simTicks = 0;           // v2.21: ghost ticks stepped for the current click
@@ -279,6 +308,14 @@ namespace {
         bool heatmap = true;         // v2.51: death marks on the progress bar
         bool saveDing = true;        // v2.56: ding when a click is saved
         CCLabelBMFont* hintLabel = nullptr;  // v2.51: training hint ("2t early")
+        bool showHint = false;       // console toggle: draw the training hint text (off by default)
+        bool showAutoTag = false;    // console toggle: "AUTO INPUTS ON" tag (off by default)
+        bool showTpsText = false;    // console toggle: TPS text (off by default)
+        CCLabelBMFont* autoTagLabel = nullptr;
+        CCLabelBMFont* tpsLabel = nullptr;
+        bool showWatermark = false;  // console toggle: "Testing | stage" label (off by default)
+        bool showComplete = false;   // console toggle: "Testing was on" on the level complete screen (off by default)
+        CCLabelBMFont* watermarkLabel = nullptr;
         CCDrawNode* heatNode = nullptr;      // v2.51: death marks on the progress bar
         bool ufoSmart = true;        // v2.40: UFO landing + "could you have flapped again" scoring
         bool spiderSmart = true;     // v2.15: spider-aware landing + "could you have flipped back" scoring
@@ -286,8 +323,6 @@ namespace {
         bool robotSmart = true;      // v2.12: robot presses count as safe if some hold length survives
         bool robotAutoRelease = false;  // v2.12: robot auto-release (practice mode only)
         bool autoNormalRuns = false; // v2.14: let auto-release work outside practice too
-        CCLabelBMFont* autoTag = nullptr;  // v2.14: on-screen "AUTO-RELEASE ON" tag
-        CCLabelBMFont* watermark = nullptr;  // v2.46: always-on "Click Before Frames" label while the buffer is on
         bool usedThisAttempt = false;      // v2.46: the buffer was on at some point of this attempt
         bool learn = true;           // v2.13: per-level memory learned from your runs
         bool fullState = true;       // v2.11.1: copy the full v2.8 player state into the ghost
@@ -309,7 +344,6 @@ namespace {
     } buf;
 
     std::string stageText();
-    void forgetMoveTriggers();
 
     // v2.23 unlocked FPS: GD runs round(max(1, frameTime * 240)) physics steps per frame,
     // so only 60 / 120 / 240 FPS give 240 steps a second (144 FPS -> 288, 360 FPS -> 360).
@@ -358,62 +392,449 @@ namespace {
         int maxAt = 0;
     } drift;
 
-    constexpr float PANEL_W = 320.f;
-    constexpr float PANEL_H = 178.f;
-
-    // Log line colors: saves green, orbs cyan, auto-release purple, misses grey,
-    // budget / skips orange, drift yellow.
-    ccColor3B lineColor(std::string const& line) {
-        auto starts = [&](char const* prefix) { return line.rfind(prefix, 0) == 0; };
-        if (starts("SAVED") || starts("MORE TIME")) return { 120, 255, 140 };
-        if (starts("ORB") || starts("orb")) return { 90, 220, 255 };
-        if (starts("AUTO")) return { 200, 150, 255 };
-        if (starts("no save")) return { 175, 175, 190 };
-        if (starts("skip") || starts("prediction budget")) return { 255, 180, 80 };
-        if (starts("drift")) return { 255, 240, 150 };
-        if (starts("ghost killed") || starts("  hitbox")) return { 255, 120, 120 };
-        if (starts("perf")) return { 150, 200, 255 };
-        if (starts("Stage") || starts("v2") || starts("path") || starts("Click") || starts("CBF")) return { 255, 215, 90 };
-        if (starts("pass")) return { 140, 150, 170 };
-        if (starts("memory")) return { 255, 150, 220 };
-        if (starts("console")) return { 150, 255, 200 };
-        return { 255, 255, 255 };
-    }
-
-    // In-game console (F9): current stage + the same live log the Windows console shows.
-    // Hidden by default; only touched when open, so it costs nothing while closed.
-    void refreshPanel() {
-        if (!buf.panel) {
-            return;
-        }
-        buf.panel->setVisible(buf.panelOpen);
-        if (!buf.panelOpen) {
-            return;
-        }
-        buf.panelTitle->setString(stageText().c_str());
-        buf.panelTitle->limitLabelWidth(PANEL_W - 20.f, 0.4f, 0.2f);
-        size_t first = buf.logLines.size() > buf.panelLines.size() ? buf.logLines.size() - buf.panelLines.size() : 0;
-        for (size_t i = 0; i < buf.panelLines.size(); ++i) {
-            auto* label = buf.panelLines[i];
-            size_t at = first + i;
-            if (at < buf.logLines.size()) {
-                auto const& line = buf.logLines[at];
-                label->setString(line.c_str());
-                label->setColor(lineColor(line));
-                label->limitLabelWidth(PANEL_W - 20.f, 0.55f, 0.3f);
-            }
-            else {
-                label->setString("");
-            }
-        }
-    }
-
-    // Log line -> in-game panel history, plus the Windows console if enabled.
-    // (Formatting a short string is cheap; it was the synchronous console writes
-    //  that hitched, and those still only happen with the console setting on.)
+    // Log line -> export history, plus the live Windows console (written by a background
+    // thread, so the game thread only formats a short string and queues it).
     // v2.29: the full log (not just the 8 lines on screen) for the F8 export, with the
     // physics step each line happened on.
     constexpr size_t EXPORT_LINES = 400;
+
+    // Console lines are handed to a writer thread: a Windows console write can block for
+    // milliseconds and say() is called from the 240/s physics loop. The thread touches
+    // nothing but its own queue and stdout (no game / Cocos objects).
+    class ConsoleSink {
+    public:
+        static ConsoleSink& get() {
+            static ConsoleSink* sink = new ConsoleSink();  // never freed: the thread outlives statics
+            return *sink;
+        }
+        void start() {
+            if (m_started) {
+                return;
+            }
+            m_started = true;
+            std::thread([this] { run(); }).detach();
+        }
+        void push(std::string line) {
+            if (!m_started) {
+                return;
+            }
+            {
+                std::lock_guard lock(m_mutex);
+                if (m_queue.size() >= 4000) {
+                    m_queue.pop_front();
+                }
+                m_queue.push_back(std::move(line));
+            }
+            m_cv.notify_one();
+        }
+    private:
+        void run() {
+            std::deque<std::string> batch;
+            for (;;) {
+                {
+                    std::unique_lock lock(m_mutex);
+                    m_cv.wait(lock, [this] { return !m_queue.empty(); });
+                    batch.swap(m_queue);
+                }
+                for (auto const& line : batch) {
+                    std::fputs(line.c_str(), stdout);
+                    std::fputc('\n', stdout);
+                }
+                std::fflush(stdout);
+                batch.clear();
+            }
+        }
+        std::mutex m_mutex;
+        std::condition_variable m_cv;
+        std::deque<std::string> m_queue;
+        bool m_started = false;
+    };
+    // ---------- external console link (named pipe) ----------
+    // Everything in here runs on its own threads and touches NO game / Cocos objects: it only
+    // parses and validates text, then queues commands. The game thread drains the queue
+    // (pumpPipe, in the CCScheduler hook). If no app is connected nothing is queued or sent.
+    struct Cmd {
+        std::string kind;   // hello | get_config | set | stage | preset | action | reset
+        std::string key;    // set: setting key
+        cfg::Val value;     // set / stage: the value
+        std::string name;   // preset / action / reset name
+        std::string id;     // optional correlation id (already JSON-encoded), echoed in the ack
+    };
+
+    class PipeServer {
+    public:
+        static PipeServer& get() {
+            static PipeServer* p = new PipeServer();  // never freed: threads outlive statics
+            return *p;
+        }
+        bool connected() const { return m_connected.load(); }
+        bool takeHello() { return m_hello.exchange(false); }
+        bool hasCommands() const { return m_hasCmds.load(); }
+        int dropped() const { return m_dropped.load(); }  // v2.87.1: commands refused because the queue was full
+
+        // Game thread: a one-time text when the pipe could not be created (and one when it works again).
+        std::string takePipeNotice() {
+            if (m_pipeFailed.load() && !m_pipeFailShown) {
+                m_pipeFailShown = true;
+                return "console link: the named pipe could not be created (error " + std::to_string(m_pipeError.load()) + "); retrying in the background";
+            }
+            if (m_pipeRecovered.exchange(false)) {
+                m_pipeFailed = false;
+                m_pipeFailShown = false;
+                return "console link: the named pipe is available now";
+            }
+            return std::string();
+        }
+
+        void send(std::string line) {
+            if (!m_connected.load()) {
+                return;
+            }
+            std::lock_guard lock(m_outMutex);
+            if (m_out.size() >= 6000) {
+                m_out.pop_front();
+            }
+            m_out.push_back(std::move(line));
+        }
+        void log(int tick, std::string const& msg) {
+            if (!m_connected.load()) {
+                return;
+            }
+            send("{\"type\":\"log\",\"tick\":" + std::to_string(tick) + ",\"msg\":" + cfg::jstr(msg) + "}");
+        }
+        bool pop(Cmd& out) {
+            std::lock_guard lock(m_cmdMutex);
+            if (m_cmds.empty()) {
+                m_hasCmds = false;
+                return false;
+            }
+            out = std::move(m_cmds.front());
+            m_cmds.pop_front();
+            m_hasCmds = !m_cmds.empty();
+            return true;
+        }
+        void start() {
+#ifdef GEODE_IS_WINDOWS
+            if (m_started.exchange(true)) {
+                return;
+            }
+            std::thread([this] { pipeLoop(); }).detach();
+            std::thread([this] { hotkeyLoop(); }).detach();
+#endif
+        }
+
+    private:
+        // v2.87.1: a full queue is no longer silent. The command is counted (state message: droppedCmds)
+        // and a pipe client gets an explicit error ack (key presses have no client to answer).
+        void pushCmd(Cmd c, bool reply = true) {
+            {
+                std::lock_guard lock(m_cmdMutex);
+                if (m_cmds.size() < 256) {
+                    m_cmds.push_back(std::move(c));
+                    m_hasCmds = true;
+                    return;
+                }
+            }
+            ++m_dropped;
+            if (reply) {
+                ack(c, c.kind, "command queue full, command dropped", c.id);
+            }
+        }
+        void ack(Cmd const& c, std::string const& cmd, std::string const& err, std::string const& id) {
+            std::string o = "{\"type\":\"ack\",\"cmd\":" + cfg::jstr(cmd) + ",\"ok\":" + (err.empty() ? "true" : "false");
+            if (!err.empty()) {
+                o += ",\"error\":" + cfg::jstr(err);
+            }
+            if (!id.empty()) {
+                o += ",\"id\":" + id;
+            }
+            send(o + "}");
+        }
+
+        // Whitelist: known command, known key, right type, inside the range. Nothing else gets queued.
+        void handleLine(std::string const& line) {
+            cfg::Obj o;
+            std::string perr;
+            Cmd none;
+            if (!cfg::parseFlat(line, o, &perr)) {
+                ack(none, "?", "bad JSON: " + perr, "");
+                return;
+            }
+            std::string id;
+            if (auto it = o.find("id"); it != o.end() && (it->second.t == cfg::Val::Num || it->second.t == cfg::Val::Str)) {
+                id = cfg::jval(it->second);
+            }
+            auto cit = o.find("cmd");
+            if (cit == o.end() || cit->second.t != cfg::Val::Str) {
+                ack(none, "?", "missing \"cmd\"", id);
+                return;
+            }
+            std::string name = cit->second.s;
+            Cmd c;
+            c.kind = name;
+            c.id = id;
+            auto text = [&](char const* k) { auto it = o.find(k); return it != o.end() && it->second.t == cfg::Val::Str ? it->second.s : std::string(); };
+
+            if (name == "ping") {
+                send("{\"type\":\"pong\"" + (id.empty() ? std::string() : ",\"id\":" + id) + "}");
+                return;
+            }
+            if (name == "hello" || name == "get_config") {
+                pushCmd(std::move(c));
+                return;
+            }
+            if (name == "set") {
+                c.key = text("key");
+                if (c.key == "config-version") {  // v2.87.1: internal, only the mod itself writes it
+                    ack(c, name, "'config-version' is read-only", id);
+                    return;
+                }
+                auto vit = o.find("value");
+                if (vit == o.end()) {
+                    ack(c, name, "missing \"value\"", id);
+                    return;
+                }
+                c.value = vit->second;
+                std::string err = cfg::config().validate(c.key, c.value);
+                if (!err.empty()) {
+                    ack(c, name, err, id);
+                    return;
+                }
+                pushCmd(std::move(c));
+                return;
+            }
+            if (name == "stage") {
+                auto vit = o.find("value");
+                if (vit == o.end() || vit->second.t != cfg::Val::Num || vit->second.n < 0 || vit->second.n > STAGE_COUNT - 1 ||
+                    std::floor(vit->second.n) != vit->second.n) {
+                    ack(c, name, "stage needs a whole number 0.." + std::to_string(STAGE_COUNT - 1), id);
+                    return;
+                }
+                c.value = vit->second;
+                pushCmd(std::move(c));
+                return;
+            }
+            if (name == "preset") {
+                c.name = text("name");
+                if (c.name != "safe" && c.name != "balanced" && c.name != "aggressive") {
+                    ack(c, name, "preset must be safe, balanced or aggressive", id);
+                    return;
+                }
+                pushCmd(std::move(c));
+                return;
+            }
+            if (name == "action") {
+                c.name = text("name");
+                if (!validAction(c.name)) {
+                    ack(c, name, "unknown action '" + c.name + "'", id);
+                    return;
+                }
+                pushCmd(std::move(c));
+                return;
+            }
+            if (name == "reset") {
+                c.name = text("what");
+                if (c.name != "settings" && c.name != "binds" && c.name != "all") {
+                    ack(c, name, "what must be settings, binds or all", id);
+                    return;
+                }
+                pushCmd(std::move(c));
+                return;
+            }
+            ack(c, name, "unknown command", id);
+        }
+
+    public:
+        static bool validAction(std::string const& n) {
+            for (auto const& a : cfg::actions()) {
+                if (n == a.name) {
+                    return true;
+                }
+            }
+            if (n.rfind("toggle:", 0) == 0) {
+                auto const* sp = cfg::findSpec(n.substr(7));
+                return sp && sp->kind == cfg::Kind::Bool;
+            }
+            return false;
+        }
+
+    private:
+#ifdef GEODE_IS_WINDOWS
+        void pipeLoop() {
+            // v2.87.1: if the pipe can't be created (name still taken, no rights...), try again with a growing
+            // pause (1 s, 2 s ... 30 s) instead of giving up for the whole session. The game thread tells
+            // the player once when it fails and once when it works (say() isn't thread-safe).
+            HANDLE h = INVALID_HANDLE_VALUE;
+            DWORD wait = 1000;
+            for (;;) {
+                h = CreateNamedPipeA("\\\\.\\pipe\\abhyu-input-buffer-testing", PIPE_ACCESS_DUPLEX,
+                    PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_NOWAIT | PIPE_REJECT_REMOTE_CLIENTS, 1, 1 << 16, 1 << 16, 0, nullptr);
+                if (h != INVALID_HANDLE_VALUE) {
+                    break;
+                }
+                if (!m_pipeFailed.load()) {
+                    m_pipeError = static_cast<unsigned long>(GetLastError());
+                    m_pipeFailed = true;
+                }
+                Sleep(wait);
+                wait = std::min<DWORD>(wait * 2, 30000);
+            }
+            if (m_pipeFailed.load()) {
+                m_pipeRecovered = true;
+            }
+            bool connected = false;
+            std::string inbuf, pending;
+            auto drop = [&] {
+                DisconnectNamedPipe(h);
+                connected = false;
+                m_connected = false;
+                inbuf.clear();
+                pending.clear();
+                std::lock_guard lock(m_outMutex);
+                m_out.clear();
+            };
+            for (;;) {
+                if (!connected) {
+                    BOOL ok = ConnectNamedPipe(h, nullptr);
+                    DWORD e = ok ? 0 : GetLastError();
+                    if (ok || e == ERROR_PIPE_CONNECTED) {
+                        connected = true;
+                        {
+                            std::lock_guard lock(m_outMutex);
+                            m_out.clear();
+                        }
+                        m_connected = true;
+                        m_hello = true;
+                    }
+                    else {
+                        if (e == ERROR_NO_DATA) {
+                            DisconnectNamedPipe(h);  // a client came and left before we noticed
+                        }
+                        Sleep(100);
+                        continue;
+                    }
+                }
+                // incoming
+                DWORD avail = 0;
+                if (!PeekNamedPipe(h, nullptr, 0, nullptr, &avail, nullptr)) {
+                    drop();
+                    continue;
+                }
+                while (avail > 0) {
+                    char chunk[4096];
+                    DWORD got = 0;
+                    if (!ReadFile(h, chunk, std::min<DWORD>(avail, sizeof chunk), &got, nullptr) || got == 0) {
+                        break;
+                    }
+                    avail -= std::min(avail, got);
+                    inbuf.append(chunk, got);
+                }
+                for (size_t nl; (nl = inbuf.find('\n')) != std::string::npos;) {
+                    std::string line = inbuf.substr(0, nl);
+                    inbuf.erase(0, nl + 1);
+                    if (!line.empty() && line.back() == '\r') {
+                        line.pop_back();
+                    }
+                    if (!line.empty()) {
+                        handleLine(line);
+                    }
+                }
+                if (inbuf.size() > 65536) {
+                    inbuf.clear();  // garbage without a newline
+                }
+                // outgoing
+                {
+                    std::lock_guard lock(m_outMutex);
+                    while (!m_out.empty()) {
+                        pending += m_out.front();
+                        pending += '\n';
+                        m_out.pop_front();
+                    }
+                }
+                if (pending.size() > (2u << 20)) {
+                    pending.clear();  // the app stopped reading: drop instead of growing forever
+                }
+                if (!pending.empty()) {
+                    DWORD wrote = 0;
+                    if (!WriteFile(h, pending.data(), static_cast<DWORD>(std::min<size_t>(pending.size(), 1 << 15)), &wrote, nullptr)) {
+                        drop();
+                        continue;
+                    }
+                    pending.erase(0, wrote);
+                }
+                Sleep(pending.empty() ? 5 : 1);
+            }
+        }
+
+        // Keys: polled while Geometry Dash is the foreground window. Nothing is registered with
+        // the system (no RegisterHotKey), so no key is taken from any other program.
+        void hotkeyLoop() {
+            struct Bind { std::string action; int vk; int mods; bool was; };
+            std::vector<Bind> binds;
+            auto lastLoad = std::chrono::steady_clock::now() - std::chrono::seconds(10);
+            for (;;) {
+                Sleep(8);
+                auto now = std::chrono::steady_clock::now();
+                if (now - lastLoad > std::chrono::milliseconds(250)) {
+                    lastLoad = now;
+                    std::vector<Bind> fresh;
+                    for (auto const& sp : cfg::specs()) {
+                        if (!cfg::isBind(sp.key)) {
+                            continue;
+                        }
+                        std::string v = cfg::s(sp.key.c_str());
+                        int vk = 0, mods = 0;
+                        if (!v.empty() && cfg::parseKey(v, vk, mods)) {
+                            bool was = false;
+                            for (auto const& old : binds) {
+                                if (old.action == sp.key.substr(5) && old.vk == vk && old.mods == mods) {
+                                    was = old.was;
+                                }
+                            }
+                            fresh.push_back({ sp.key.substr(5), vk, mods, was });
+                        }
+                    }
+                    binds.swap(fresh);
+                }
+                HWND fg = GetForegroundWindow();
+                DWORD pid = 0;
+                if (fg) {
+                    GetWindowThreadProcessId(fg, &pid);
+                }
+                // v2.87.1: only the game's own window. The live console belongs to this process too, so
+                // typing in it (or in a Windows console of the same process) no longer fires hotkeys.
+                bool focus = fg && pid == GetCurrentProcessId() && fg != GetConsoleWindow();
+                int mods = ((GetAsyncKeyState(VK_CONTROL) & 0x8000) ? cfg::CTRL : 0) | ((GetAsyncKeyState(VK_SHIFT) & 0x8000) ? cfg::SHIFT : 0) |
+                           ((GetAsyncKeyState(VK_MENU) & 0x8000) ? cfg::ALT : 0);
+                for (auto& b : binds) {
+                    bool down = (GetAsyncKeyState(b.vk) & 0x8000) != 0 && mods == b.mods;
+                    if (down && !b.was && focus) {
+                        Cmd c;
+                        c.kind = "action";
+                        c.name = b.action;
+                        pushCmd(std::move(c), false);
+                    }
+                    b.was = down;
+                }
+            }
+        }
+#endif
+
+        std::atomic<bool> m_connected{ false };
+        std::atomic<bool> m_hello{ false };
+        std::atomic<bool> m_hasCmds{ false };
+        std::atomic<bool> m_started{ false };
+        std::atomic<int> m_dropped{ 0 };
+        std::atomic<bool> m_pipeFailed{ false };
+        std::atomic<bool> m_pipeRecovered{ false };
+        std::atomic<unsigned long> m_pipeError{ 0 };
+        bool m_pipeFailShown = false;  // game thread only
+        std::mutex m_cmdMutex, m_outMutex;
+        std::deque<Cmd> m_cmds;
+        std::deque<std::string> m_out;
+    };
+    std::string g_lastDecision;  // last SAVED / TRAIN line, for the console's state message
+
     std::deque<std::string> exportLines;
     int logClock = 0;  // physics steps since the level started, kept by the update hook
 
@@ -424,149 +845,17 @@ namespace {
         while (exportLines.size() > EXPORT_LINES) {
             exportLines.pop_front();
         }
-        buf.logLines.push_back(msg);
-        while (buf.logLines.size() > PANEL_LINES) {
-            buf.logLines.pop_front();
-        }
         if (buf.console) {
-            std::printf("[InputBuffer] %s\n", msg.c_str());
+            ConsoleSink::get().push(fmt::format("[{:>6}] {}", logClock, msg));
         }
-        // v2.71: redrawn once per physics step instead of on every line (a click that logs
-        // 4 lines rebuilt all 8 labels 4 times)
-        buf.panelDirty = buf.panelOpen;
+        if (msg.rfind("SAVED", 0) == 0 || msg.rfind("TRAIN", 0) == 0) {
+            g_lastDecision = fmt::format("[{}] {}", logClock, msg);
+        }
+        PipeServer::get().log(logClock, msg);
     }
 
     bool isGhost(PlayerObject* p) {
         return p && (p == buf.ghost1 || p == buf.ghost2);
-    }
-
-    // v2.79 predict through portals: a mode portal the ghost reaches switches the ghost's own
-    // mode (the player's toggles, no effects), and the prediction keeps going instead of
-    // stopping there. Only the ghost changes; the level's floor / ceiling for the new mode
-    // isn't set, so a ship or wave right after a portal is predicted without those bounds.
-    // Dual portals still stop the prediction (v2.84: teleport and solo portals are taken, see
-    // ghostTeleport). Returns false for those.
-    bool ghostTakePortal(PlayerObject* g, GameObjectType type) {
-        switch (type) {
-            case GameObjectType::CubePortal:
-            case GameObjectType::ShipPortal:
-            case GameObjectType::UfoPortal:
-            case GameObjectType::BallPortal:
-            case GameObjectType::WavePortal:
-            case GameObjectType::RobotPortal:
-            case GameObjectType::SpiderPortal:
-            case GameObjectType::SwingPortal:
-                break;
-            default:
-                return false;
-        }
-        bool already = (type == GameObjectType::ShipPortal && g->m_isShip) || (type == GameObjectType::UfoPortal && g->m_isBird) ||
-            (type == GameObjectType::BallPortal && g->m_isBall) || (type == GameObjectType::WavePortal && g->m_isDart) ||
-            (type == GameObjectType::RobotPortal && g->m_isRobot) || (type == GameObjectType::SpiderPortal && g->m_isSpider) ||
-            (type == GameObjectType::SwingPortal && g->m_isSwing) ||
-            (type == GameObjectType::CubePortal && !g->m_isShip && !g->m_isBird && !g->m_isBall && !g->m_isDart && !g->m_isRobot &&
-                !g->m_isSpider && !g->m_isSwing);
-        if (already) {
-            return true;
-        }
-        if (g->m_isShip) g->toggleFlyMode(false, true);
-        if (g->m_isBird) g->toggleBirdMode(false, true);
-        if (g->m_isBall) g->toggleRollMode(false, true);
-        if (g->m_isDart) g->toggleDartMode(false, true);
-        if (g->m_isRobot) g->toggleRobotMode(false, true);
-        if (g->m_isSpider) g->toggleSpiderMode(false, true);
-        if (g->m_isSwing) g->toggleSwingMode(false, true);
-        switch (type) {
-            case GameObjectType::ShipPortal: g->toggleFlyMode(true, true); break;
-            case GameObjectType::UfoPortal: g->toggleBirdMode(true, true); break;
-            case GameObjectType::BallPortal: g->toggleRollMode(true, true); break;
-            case GameObjectType::WavePortal: g->toggleDartMode(true, true); break;
-            case GameObjectType::RobotPortal: g->toggleRobotMode(true, true); break;
-            case GameObjectType::SpiderPortal: g->toggleSpiderMode(true, true); break;
-            case GameObjectType::SwingPortal: g->toggleSwingMode(true, true); break;
-            default: break;  // cube: every mode off
-        }
-        buf.ghostSwitched = true;
-        return true;
-    }
-
-    // v2.84 teleport portals: the ghost jumps by the blue -> orange offset (how plain teleport
-    // pairs move you) and keeps going instead of the prediction stopping there. Portals with
-    // forces, redirects or gravity changes still stop it. Returns false for those.
-    bool ghostTeleport(PlayerObject* g, GameObject* object) {
-        if (object->m_objectType != GameObjectType::TeleportPortal) {
-            return false;
-        }
-        if (object->m_objectID != 747) {
-            return object->m_objectID == 749;  // touching the orange end does nothing
-        }
-        auto* t = static_cast<TeleportPortalObject*>(object);
-        if (t->m_staticForceEnabled || t->m_redirectForceEnabled || t->m_gravityMode != 0 || t->m_redirectDash) {
-            return false;
-        }
-        double dx = 0.0, dy = t->m_teleportYOffset;
-        if (t->m_orangePortal && t->m_orangePortal != t) {
-            dx = t->m_orangePortal->m_positionX - t->m_positionX;
-            dy = t->m_orangePortal->m_positionY - t->m_positionY;
-        }
-        if (t->m_ignoreX) {
-            dx = 0.0;
-        }
-        if (t->m_ignoreY) {
-            dy = 0.0;
-        }
-        if (dx == 0.0 && dy == 0.0) {
-            return true;
-        }
-        CCPoint shift { static_cast<float>(dx), static_cast<float>(dy) };
-        CCPoint pos = g->getPosition() + shift;
-        g->setPosition(pos);
-        g->m_position = pos;
-        g->m_lastPosition = g->m_lastPosition + shift;
-        g->m_isOnGround = false;
-        return true;
-    }
-
-    // v2.84 solo portals: with two players, only P1 goes on after it (the prediction used to
-    // stop there); already solo, it changes nothing.
-    bool ghostSoloPortal(GameObject* object) {
-        if (object->m_objectType != GameObjectType::SoloPortal) {
-            return false;
-        }
-        buf.ghostSolo = true;
-        buf.simSecond = false;
-        return true;
-    }
-
-    void copyState(PlayerObject* ghost, PlayerObject* real);
-    void pressGhost(PlayerObject* ghost, bool down);
-
-    // v2.85 dual portals: P2 appears where P1 is, same mode and size, upside down compared to
-    // P1, holding what P1 holds, and both go on (the prediction used to stop there). Already
-    // dual, it changes nothing.
-    bool ghostDualPortal(PlayerObject* g, GameObject* object) {
-        if (object->m_objectType != GameObjectType::DualPortal) {
-            return false;
-        }
-        if (buf.simSecond) {
-            return true;
-        }
-        if (g != buf.ghost1 || !buf.ghost2) {
-            return false;
-        }
-        auto* g2 = buf.ghost2;
-        float shift = buf.ghostShiftX;
-        buf.ghostShiftX = 0.f;
-        copyState(g2, g);
-        buf.ghostShiftX = shift;
-        g2->setPosition(g->getPosition());
-        g2->m_position = g->m_position;
-        g2->m_lastPosition = g->m_lastPosition;
-        g2->flipGravity(!g->m_isUpsideDown, true);
-        pressGhost(g2, buf.held1);
-        buf.simSecond = true;
-        buf.ghostSolo = false;
-        return true;
     }
 
     void resetPending() {
@@ -575,68 +864,67 @@ namespace {
         buf.releaseShift = 0;
     }
 
-    void readModeTicks();
-
     void readSettings() {
-        auto* mod = Mod::get();
-        buf.smart = mod->getSettingValue<bool>("smart-prediction");
-        buf.portalPredict = mod->getSettingValue<bool>("predict-through-portals");
-        buf.budgetMs = mod->getSettingValue<double>("sim-budget-ms");
-        buf.autoBudget = mod->getSettingValue<bool>("auto-budget");
-        buf.practiceOnly = mod->getSettingValue<bool>("practice-only");
-        buf.groundHorizon = static_cast<int>(mod->getSettingValue<int64_t>("ground-horizon"));
-        buf.waveHorizon = static_cast<int>(mod->getSettingValue<int64_t>("wave-horizon"));
-        buf.assumeOrbs = mod->getSettingValue<bool>("orb-assume-hit");
+        buf.smart = cfg::b("smart-prediction");
+        buf.budgetMs = cfg::d("sim-budget-ms");
+        buf.autoBudget = cfg::b("auto-budget");
+        buf.practiceOnly = cfg::b("practice-only");
+        buf.groundHorizon = static_cast<int>(cfg::i("ground-horizon"));
+        buf.waveHorizon = static_cast<int>(cfg::i("wave-horizon"));
+        buf.assumeOrbs = cfg::b("orb-assume-hit");
         buf.orbClick = buf.assumeOrbs;
-        buf.tryBothOrbs = mod->getSettingValue<bool>("orb-try-both");
-        buf.avoidMovers = mod->getSettingValue<bool>("avoid-moving-objects");
-        buf.autoRelease = mod->getSettingValue<bool>("wave-auto-release");
-        buf.autoClick = mod->getSettingValue<bool>("auto-click");
-        buf.autoWindow = static_cast<int>(mod->getSettingValue<int64_t>("auto-release-window"));
-        buf.driftCheck = mod->getSettingValue<bool>("drift-check");
-        buf.spamGap = static_cast<int>(mod->getSettingValue<int64_t>("wave-spam-gap"));
-        buf.spamStreak = static_cast<int>(mod->getSettingValue<int64_t>("wave-spam-streak"));
-        buf.orbAlign = mod->getSettingValue<bool>("orb-align");
-        buf.orbTiming = mod->getSettingValue<bool>("orb-timing");
-        buf.orbAlignGround = mod->getSettingValue<bool>("orb-align-ground");
-        buf.fullState = mod->getSettingValue<bool>("full-ghost-state");
-        buf.learn = mod->getSettingValue<bool>("level-memory");
-        buf.robotSmart = mod->getSettingValue<bool>("robot-smart");
-        buf.spiderSmart = mod->getSettingValue<bool>("spider-smart");
-        buf.ufoSmart = mod->getSettingValue<bool>("ufo-smart");
-        buf.ballSmart = mod->getSettingValue<bool>("ball-smart");
-        buf.swingSmart = mod->getSettingValue<bool>("swing-smart");
-        buf.train = mod->getSettingValue<bool>("training-mode");
-        buf.perLevel = mod->getSettingValue<bool>("per-level-settings");
-        buf.heatmap = mod->getSettingValue<bool>("death-heatmap");
-        buf.saveDing = mod->getSettingValue<bool>("save-ding");
-        buf.moreTime = mod->getSettingValue<bool>("more-time-death-spots");
-        buf.dashAutoRelease = mod->getSettingValue<bool>("dash-auto-release");
-        buf.perfLog = mod->getSettingValue<bool>("perf-log");
-        buf.shipBuffer = mod->getSettingValue<bool>("ship-buffer");
-        buf.lateCrash = static_cast<int>(mod->getSettingValue<int64_t>("cube-late-crash"));
-        buf.robustSaves = mod->getSettingValue<bool>("robust-saves");
-        buf.ignoreTouching = mod->getSettingValue<bool>("ignore-touching-hazards");
-        buf.deathLog = mod->getSettingValue<bool>("death-log");
-        buf.explain = mod->getSettingValue<bool>("explain-inputs");
+        buf.tryBothOrbs = cfg::b("orb-try-both");
+        buf.avoidMovers = cfg::b("avoid-moving-objects");
+        buf.autoRelease = cfg::b("wave-auto-release");
+        buf.autoWindow = static_cast<int>(cfg::i("auto-release-window"));
+        buf.driftCheck = cfg::b("drift-check");
+        buf.spamGap = static_cast<int>(cfg::i("wave-spam-gap"));
+        buf.orbAlign = cfg::b("orb-align");
+        buf.orbTiming = cfg::b("orb-timing");
+        buf.orbAlignGround = cfg::b("orb-align-ground");
+        buf.fullState = cfg::b("full-ghost-state");
+        buf.learn = cfg::b("level-memory");
+        buf.robotSmart = cfg::b("robot-smart");
+        buf.spiderSmart = cfg::b("spider-smart");
+        buf.ufoSmart = cfg::b("ufo-smart");
+        buf.ballSmart = cfg::b("ball-smart");
+        buf.swingSmart = cfg::b("swing-smart");
+        buf.train = cfg::b("training-mode");
+        buf.perLevel = cfg::b("per-level-settings");
+        buf.heatmap = cfg::b("death-heatmap");
+        buf.saveDing = cfg::b("save-ding");
+        buf.showHint = cfg::b("show-hint-text");
+        buf.showAutoTag = cfg::b("show-auto-tag");
+        buf.showTpsText = cfg::b("show-tps-text");
+        buf.showWatermark = cfg::b("show-watermark");
+        buf.showComplete = cfg::b("show-complete-label");
+        buf.moreTime = cfg::b("more-time-death-spots");
+        buf.dashAutoRelease = cfg::b("dash-auto-release");
+        buf.perfLog = cfg::b("perf-log");
+        buf.shipBuffer = cfg::b("ship-buffer");
+        buf.lateCrash = static_cast<int>(cfg::i("cube-late-crash"));
+        buf.robustSaves = cfg::b("robust-saves");
+        buf.ignoreTouching = cfg::b("ignore-touching-hazards");
+        buf.deathLog = cfg::b("death-log");
+        buf.explain = cfg::b("explain-inputs");
         // v2.35 low latency mode: for players who feel the buffer as input lag. Short searches
         // (no frame hitches), at most 1 frame of delay, no extra "margin" ticks, and clicks
         // made while a delay is waiting aren't shifted (see intercept).
-        buf.predictMovers = mod->getSettingValue<bool>("predict-moving-objects");
-        buf.predictTriggers = mod->getSettingValue<bool>("predict-move-triggers");
-        buf.noHitch = mod->getSettingValue<bool>("no-hitch-searches");
-        buf.nextClick = mod->getSettingValue<bool>("plan-next-click");
-        buf.shipMaxDelay = static_cast<int>(mod->getSettingValue<int64_t>("ship-max-delay"));
-        readModeTicks();
-        buf.shipSpamGap = static_cast<int>(mod->getSettingValue<int64_t>("ship-spam-gap"));
-        buf.cbfSync = mod->getSettingValue<bool>("cbf-sync");
-        buf.robotAutoRelease = mod->getSettingValue<bool>("robot-auto-release");
-        buf.autoNormalRuns = mod->getSettingValue<bool>("auto-release-normal-runs");
-        buf.waveV46 = mod->getSettingValue<bool>("wave-v46");
-        buf.waveMargin = mod->getSettingValue<bool>("wave-safety-margin");
-        buf.orbWindow = static_cast<int>(mod->getSettingValue<int64_t>("orb-align-ticks"));
-        // v2.58: last, so its overrides stick (wave margin used to be read again after it)
-        buf.lowLatency = mod->getSettingValue<bool>("low-latency");
+        buf.predictMovers = cfg::b("predict-moving-objects");
+        buf.shipMaxDelay = static_cast<int>(cfg::i("ship-max-delay"));
+        buf.shipSpamGap = static_cast<int>(cfg::i("ship-spam-gap"));
+        buf.cbfSync = cfg::b("cbf-sync");
+        buf.robotAutoRelease = cfg::b("robot-auto-release");
+        buf.autoNormalRuns = cfg::b("auto-release-normal-runs");
+        buf.autoClick = cfg::b("auto-click");
+        buf.spamStreak = std::clamp(static_cast<int>(cfg::i("wave-spam-streak")), 2, 6);
+        buf.portalPredict = cfg::b("predict-through-portals");
+        buf.tps = std::clamp(static_cast<int>(cfg::i("tps")), 240, 1000);
+        buf.waveV46 = cfg::b("wave-v46");
+        buf.waveMargin = cfg::b("wave-safety-margin");
+        buf.orbWindow = static_cast<int>(cfg::i("orb-align-ticks"));
+        // v2.79: read last, so its overrides stick (the wave margin used to be read again after it)
+        buf.lowLatency = cfg::b("low-latency");
         if (buf.lowLatency) {
             buf.budgetMs = std::min(buf.budgetMs, 3.0);
             buf.robustSaves = false;
@@ -645,7 +933,7 @@ namespace {
         // v2.71 performance mode: for PCs that drop frames on clicks. Shorter searches, no
         // extra robustness runs, orbs clicked only the normal way (no late-click retries), and
         // the debug runs (drift check, live path view) off.
-        buf.perfMode = mod->getSettingValue<bool>("performance-mode");
+        buf.perfMode = cfg::b("performance-mode");
         if (buf.perfMode) {
             buf.budgetMs = std::min(buf.budgetMs, 4.0);
             buf.robustSaves = false;
@@ -653,6 +941,30 @@ namespace {
             buf.driftCheck = false;
         }
         buf.userBudget = buf.budgetMs;
+        // v2.87.1 fix toggles
+        buf.fixRestart = cfg::b("fix-restart-state");
+        buf.fixDualHarmless = cfg::b("fix-dual-harmless");
+        buf.fixLowLatQueue = cfg::b("fix-lowlat-queue");
+        buf.fixPracticeQueue = cfg::b("fix-practice-queue");
+        buf.fixGroupOn = cfg::b("fix-group-on");
+        buf.fixOrbChecks = cfg::b("fix-orb-checks");
+        buf.fixMoreTimeChecks = cfg::b("fix-more-time-checks");
+        buf.fixTrainingAuto = cfg::b("fix-training-auto");
+        buf.fixMoverConflict = cfg::b("fix-mover-conflict");
+        buf.fixAutoThrottle = cfg::b("fix-auto-throttle");
+        // 7.4: predicting moving objects and refusing to buffer near them work against each other;
+        // with the fix on, predict wins
+        static bool conflictTold = false;
+        if (buf.fixMoverConflict && buf.predictMovers && buf.avoidMovers) {
+            buf.avoidMovers = false;
+            if (!conflictTold) {
+                conflictTold = true;
+                say("predict-moving-objects and avoid-moving-objects are both on: predict wins, avoid is ignored");
+            }
+        }
+        else {
+            conflictTold = false;
+        }
     }
 
     // v2.76 auto budget: the budget setting is used as it is, and only cut (to 4 ms) while
@@ -677,78 +989,19 @@ namespace {
         buf.budgetMs = budget;
     }
 
-    // v2.88 per-mode frames, kept in the mod's saved values (they start from your custom stage)
-    constexpr char const* MODE_NAMES[] = { "Cube", "Ship", "Ball", "UFO", "Wave", "Robot", "Spider", "Swing" };
-    constexpr int MODE_TICKS_MAX = 40;  // 10 frames
-
-    void readModeTicks() {
-        auto* mod = Mod::get();
-        buf.perMode = mod->getSavedValue<bool>("per-mode-frames", false);
-        int all = static_cast<int>(mod->getSettingValue<int64_t>("custom-ticks"));
-        int wave = static_cast<int>(mod->getSettingValue<int64_t>("custom-wave-ticks"));
-        int ship = static_cast<int>(mod->getSettingValue<int64_t>("ship-max-delay"));
-        for (int i = 0; i < 8; ++i) {
-            int fallback = i == 4 ? wave : i == 1 ? ship : all;
-            buf.modeTicks[i] = std::clamp(mod->getSavedValue<int>(fmt::format("mode-ticks-{}", i), fallback), 0, MODE_TICKS_MAX);
-        }
-    }
-
-    void saveModeTicks() {
-        auto* mod = Mod::get();
-        mod->setSavedValue("per-mode-frames", buf.perMode);
-        for (int i = 0; i < 8; ++i) {
-            mod->setSavedValue(fmt::format("mode-ticks-{}", i), buf.modeTicks[i]);
-        }
-    }
-
-    // which MODE_NAMES entry a click is for (a wave in dual counts first, like the wave rules)
-    int modeIndex(PlayerObject* p1, PlayerObject* p2) {
-        auto of = [](PlayerObject* p) {
-            return p->m_isDart ? 4 : p->m_isShip ? 1 : p->m_isBall ? 2 : p->m_isBird ? 3 : p->m_isRobot ? 5 : p->m_isSpider ? 6
-                : p->m_isSwing ? 7 : 0;
-        };
-        int m = of(p1);
-        if (p2 && of(p2) == 4) {
-            m = 4;
-        }
-        return m;
-    }
-
     void applyStage() {
+        buf.stage = std::clamp(buf.stage, 0, STAGE_COUNT - 1);
         auto const& s = STAGES[buf.stage];
         buf.enabled = s.enabled;
         if (s.custom) {
-            buf.ticksAll = static_cast<int>(Mod::get()->getSettingValue<int64_t>("custom-ticks"));
-            buf.ticksWave = static_cast<int>(Mod::get()->getSettingValue<int64_t>("custom-wave-ticks"));
+            // v2.87: four custom slots; read live, so a change from the console applies at once
+            buf.ticksAll = std::clamp(static_cast<int>(cfg::i(CUSTOM_TICKS_KEY[s.slot])), 1, cfg::CUSTOM_MAX_TICKS);
+            buf.ticksWave = std::clamp(static_cast<int>(cfg::i(CUSTOM_WAVE_KEY[s.slot])), 0, cfg::CUSTOM_MAX_WAVE_TICKS);
         }
         else {
             buf.ticksAll = s.ticksAll;
             buf.ticksWave = s.ticksWave;
         }
-    }
-
-    // v2.14: a run outside practice where auto-release can press for you is marked on screen.
-    // v2.46 watermark: whenever the buffer is on (any stage but OFF) the level shows it, and
-    // can't be turned off, so runs made with the mod are recognisable.
-    void refreshWatermark() {
-        if (!buf.watermark) {
-            return;
-        }
-        // hidden in practice mode (practice runs can't be submitted, and on phones it sat on the
-        // checkpoint buttons); always shown in normal mode while the buffer is on
-        auto* layer = GameManager::get()->m_playLayer;
-        buf.watermark->setVisible(buf.enabled && !(layer && layer->m_isPracticeMode));
-        buf.watermark->setString(fmt::format("CBF  |  {}", stageText()).c_str());
-    }
-
-    void refreshAutoTag() {
-        if (!buf.autoTag) {
-            return;
-        }
-        auto* layer = GameManager::get()->m_playLayer;
-        bool on = buf.enabled && buf.autoNormalRuns && (buf.autoRelease || buf.robotAutoRelease || buf.dashAutoRelease || buf.autoClick) &&
-            layer && !layer->m_isPracticeMode;
-        buf.autoTag->setVisible(on);
     }
 
     size_t memorySpots();
@@ -760,7 +1013,7 @@ namespace {
         auto* mod = Mod::get();
         auto* layer = GameManager::get()->m_playLayer;
         std::string text;
-        text += fmt::format("Click Before Frames {} console export\n", mod->getVersion().toVString());
+        text += fmt::format("Testing {} console export\n", mod->getVersion().toVString());
         if (layer && layer->m_level) {
             text += fmt::format("Level: {} (id {}){}\n", std::string(layer->m_level->m_levelName), layer->m_level->m_levelID.value(),
                 layer->m_isPracticeMode ? ", practice" : "");
@@ -773,17 +1026,17 @@ namespace {
             buf.orbAlignGround, buf.orbWindow, buf.orbTiming, buf.assumeOrbs, buf.tryBothOrbs, buf.learn, memorySpots());
         text += fmt::format("wave: v4.6 {} margin {} horizon {} spam gap {} | robot smart {} | spider smart {} | ship {} (max {}t)\n",
             buf.waveV46, buf.waveMargin, buf.waveHorizon, buf.spamGap, buf.robotSmart, buf.spiderSmart, buf.shipBuffer, buf.shipMaxDelay);
-        text += fmt::format("auto-release: wave {} robot {} dash {} | auto-click {} | normal runs {} window {} | movers: avoid {} predict {}\n",
-            buf.autoRelease, buf.robotAutoRelease, buf.dashAutoRelease, buf.autoClick, buf.autoNormalRuns, buf.autoWindow, buf.avoidMovers,
+        text += fmt::format("auto-release: wave {} robot {} dash {} normal runs {} window {} | movers: avoid {} predict {}\n",
+            buf.autoRelease, buf.robotAutoRelease, buf.dashAutoRelease, buf.autoNormalRuns, buf.autoWindow, buf.avoidMovers,
             buf.predictMovers);
         text += fmt::format("debug: drift check {} | path view {} | perf log {} | death log {} | ignore touching {}\n", buf.driftCheck,
             buf.showPath, buf.perfLog, buf.deathLog, buf.ignoreTouching);
         text += fmt::format("explain inputs {} | low latency {} | cbf sync {}{}\n", buf.explain, buf.lowLatency, buf.cbfSync,
             Loader::get()->isModLoaded("syzzi.click_between_frames") ? " (CBF loaded)" : "");
-        // v2.39: CBF Extrapolate only changes what's drawn (a hidden player run ahead to "now"),
-        // never the real player's physics, so predictions aren't affected by it.
+        // v2.39: assumed (not verified): CBF Extrapolate only changes what's drawn (a hidden player run
+        // ahead to "now"), never the real player's physics, so predictions aren't affected by it.
         if (Loader::get()->isModLoaded("square3ang.cbfextrapolate")) {
-            text += "CBF Extrapolate loaded (visual only)\n";
+            text += "CBF Extrapolate loaded (assumed to be visual only, not verified)\n";
         }
         text += "----\n";
         for (auto const& line : exportLines) {
@@ -802,23 +1055,13 @@ namespace {
         if (!buf.enabled) {
             return "Buffer: OFF";
         }
-        if (buf.perMode) {
-            return fmt::format("Buffer: per mode{}", buf.train ? " [training]" : "");
-        }
-        return fmt::format("Buffer{}: {:g}f / wave {:g}f{}", STAGES[buf.stage].custom ? " (custom)" : "", buf.ticksAll * TICK,
+        auto const& cs = STAGES[std::clamp(buf.stage, 0, STAGE_COUNT - 1)];
+        std::string tag = cs.custom ? " (" + cfg::s(CUSTOM_NAME_KEY[cs.slot]) + ")" : std::string();
+        return fmt::format("Buffer{}: {:g}f / wave {:g}f{}", tag, buf.ticksAll * TICK,
             buf.ticksWave * TICK, buf.train ? " [training]" : "");
     }
 
     void dropGhosts() {
-#ifdef GEODE_IS_ANDROID
-        // v2.87 Android: the ghosts are linked to the level that is closing, and deleting them
-        // while it was being torn down crashed on Android (the freed memory is reused at once,
-        // so the crash showed up in random other mods: music, labels, the scheduler). They're
-        // only let go of here; a hidden player per level is a small cost.
-        buf.ghost1 = nullptr;
-        buf.ghost2 = nullptr;
-        buf.ghostLayer = nullptr;
-#else
         for (auto** g : { &buf.ghost1, &buf.ghost2 }) {
             if (*g) {
                 (*g)->removeFromParentAndCleanup(true);
@@ -831,22 +1074,15 @@ namespace {
             buf.ghostLayer->release();
             buf.ghostLayer = nullptr;
         }
-#endif
-        // panel nodes are owned by the PlayLayer
-        buf.panel = nullptr;
-        buf.panelTitle = nullptr;
-        buf.panelLines.clear();
         buf.pathNode = nullptr;
-        buf.autoTag = nullptr;
-        buf.watermark = nullptr;
         buf.simulating = false;
         buf.injecting = false;
         buf.rapid = 0;
         buf.autoReleased = false;
         buf.autoClicked = false;
+        buf.swallowRelease = false;
         buf.recordPath = nullptr;
         watched.clear();
-        forgetMoveTriggers();
         drift.active = false;
         resetPending();
         // v2.86: a level you left can't leave a "button down" behind for the next one
@@ -1214,8 +1450,9 @@ namespace {
 
     // v2.27 moving-object prediction. Objects near your path that are moving right now are
     // moved along their current motion during a prediction (where they'll be k steps
-    // later), and put back exactly afterwards. Straight-line movement only: easing,
-    // rotation and toggles still aren't predicted.
+    // later), and put back exactly afterwards. v2.27 was straight lines only; curved paths and
+    // rotation came in v2.68 and easing in v2.75 (below). Triggers that haven't started yet
+    // are still not predicted.
     // v2.68: also curved paths (rotate triggers move objects around a center, Orbit's saws):
     // when the direction of motion turned between the last two steps, it keeps turning by the
     // same angle each step, and objects that spin keep spinning. Still put back exactly after.
@@ -1298,798 +1535,6 @@ namespace {
             m.object->setObjectRectDirty(true);
             m.object->m_isOrientedBoxDirty = true;
         }
-    }
-
-    // v2.81 move triggers ahead: spikes, blocks and orbs that are still right now but that a
-    // move trigger further along will start moving (the ORBIT case: the prediction saw them
-    // frozen where they were). When the ghost passes such a trigger during a prediction, its
-    // group starts moving the way the game moves it (offset, duration, easing), on top of
-    // any motion it already has; everything is put back exactly afterwards. Only plain moves:
-    // target mode, lock to player / camera and spawn / touch triggered moves are skipped.
-    // v2.83: rotate triggers too (saws and arms that start spinning, around their center
-    // group or each in place), and toggle triggers that switch a group off (the ghost stops
-    // colliding with it, like a toggle orb since v2.75).
-    // v2.85: spawn triggers too, followed through their delays to the move / rotate / toggle
-    // triggers they set off (and spawn triggers they set off, 4 deep), and toggles that switch
-    // a group on (the ghost starts colliding with it).
-    enum class TriggerKind { Move, Rotate, Toggle, Spawn };
-    struct LevelTrigger {
-        EffectGameObject* trigger;
-        double x;
-        TriggerKind kind;
-    };
-    std::vector<LevelTrigger> levelTriggers;  // the level's position-activated triggers we predict, by x
-    GJBaseGameLayer* levelTriggersLayer = nullptr;
-    unsigned levelTriggersCount = 0;
-    // move / rotate triggers the real game fired (any kind, spawn / touch too) and the step
-    // they fired, so ones still in progress at your click follow their real eased path
-    std::unordered_map<EffectGameObject*, int> firedMoves;
-
-    struct ScriptedMove {
-        TriggerKind kind = TriggerKind::Move;
-        double x = 0.0;
-        int fireStep = -1;  // prediction step the ghost reached the trigger (-1 = not yet)
-        double dx = 0.0, dy = 0.0;  // move
-        double angle = 0.0;         // rotate: degrees, clockwise
-        bool hasCenter = false;
-        double cx = 0.0, cy = 0.0;
-        bool lockRot = false;
-        double steps = 0.0;  // how many physics steps it lasts
-        int easing = 0;
-        double rate = 0.0;
-        double from = 0.0;  // how far along it already was when the prediction started
-        CCArray* group = nullptr;  // toggle: the group it switches off (or on)
-        bool on = false;           // toggle: switches it on
-        bool armed = false;        // v2.85: fired (fireStep is when it acts, maybe after a spawn delay)
-        int delay = 0;             // v2.85: steps from the ghost reaching x to it acting (spawn delays)
-        bool toggled = false;
-    };
-    struct ScriptedObject {
-        GameObject* object;
-        double x, y;     // m_positionX / Y before the prediction
-        CCPoint node;    // and the node position, put back as it was
-        float rotX, rotY;
-        bool mover;      // also moved by placeMovers, which sets its base position every step
-        bool placed = false;
-        bool rotated = false;
-        std::vector<int> moves;
-        double lastX = 0.0, lastY = 0.0, lastSpin = 0.0;  // v2.84.5: where it was put last step
-    };
-    std::vector<ScriptedMove> scriptedMoves;
-    std::vector<ScriptedObject> scriptedObjects;
-    void forgetTriggerChecks();
-    constexpr int SCRIPTED_TRIGGER_LIMIT = 48;
-    // v2.85: groups the real game spawns after a delay, and the tick that happens
-    struct PendingSpawn {
-        int group;
-        int at;
-    };
-    std::vector<PendingSpawn> pendingSpawns;
-    constexpr int SCRIPTED_OBJECT_LIMIT = 160;
-    // v2.84.4: what collectScripted found, reused by every run of the same click (it used to
-    // scan the trigger groups again for every run: on ORBIT that slowed each run so much that
-    // orb searches stopped after 0-2 timings)
-    struct ScriptedCache {
-        GJBaseGameLayer* layer = nullptr;
-        int tick = -1;
-        double px = 0.0, reach = 0.0;
-        std::vector<ScriptedMove> moves;
-        std::vector<ScriptedObject> objects;
-    } scriptedCache;
-
-    void forgetMoveTriggers() {
-        scriptedCache = {};
-        pendingSpawns.clear();
-        forgetTriggerChecks();  // v2.84: a new level starts the self-check over
-        firedMoves.clear();
-        levelTriggers.clear();
-        levelTriggersLayer = nullptr;
-        levelTriggersCount = 0;
-    }
-
-    // the game's easing curves (cocos2d's), by GD's easing number
-    double easeMove(int type, double rate, double t) {
-        constexpr double PI = 3.141592653589793;
-        t = std::clamp(t, 0.0, 1.0);
-        if (t <= 0.0 || t >= 1.0) {
-            return t;
-        }
-        rate = rate > 0.0 ? rate : 2.0;
-        auto bounce = [](double u) {
-            if (u < 1.0 / 2.75) {
-                return 7.5625 * u * u;
-            }
-            if (u < 2.0 / 2.75) {
-                u -= 1.5 / 2.75;
-                return 7.5625 * u * u + 0.75;
-            }
-            if (u < 2.5 / 2.75) {
-                u -= 2.25 / 2.75;
-                return 7.5625 * u * u + 0.9375;
-            }
-            u -= 2.625 / 2.75;
-            return 7.5625 * u * u + 0.984375;
-        };
-        double period = rate > 0.0 && rate < 2.0 ? rate : 0.3;
-        double s = period / 4.0;
-        constexpr double BACK = 1.70158;
-        switch (type) {
-            case 1: {  // ease in out
-                double u = t * 2.0;
-                return u < 1.0 ? 0.5 * std::pow(u, rate) : 1.0 - 0.5 * std::pow(2.0 - u, rate);
-            }
-            case 2: return std::pow(t, rate);
-            case 3: return std::pow(t, 1.0 / rate);
-            case 4: {  // elastic in out
-                double u = t * 2.0 - 1.0;
-                return u < 0.0 ? -0.5 * std::pow(2.0, 10.0 * u) * std::sin((u - s) * 2.0 * PI / period)
-                               : std::pow(2.0, -10.0 * u) * std::sin((u - s) * 2.0 * PI / period) * 0.5 + 1.0;
-            }
-            case 5: {
-                double u = t - 1.0;
-                return -std::pow(2.0, 10.0 * u) * std::sin((u - s) * 2.0 * PI / period);
-            }
-            case 6: return std::pow(2.0, -10.0 * t) * std::sin((t - s) * 2.0 * PI / period) + 1.0;
-            case 7: return t < 0.5 ? (1.0 - bounce(1.0 - t * 2.0)) * 0.5 : bounce(t * 2.0 - 1.0) * 0.5 + 0.5;
-            case 8: return 1.0 - bounce(1.0 - t);
-            case 9: return bounce(t);
-            case 10: {
-                double u = t * 2.0;
-                return u < 1.0 ? 0.5 * std::pow(2.0, 10.0 * (u - 1.0)) : 0.5 * (2.0 - std::pow(2.0, -10.0 * (u - 1.0)));
-            }
-            case 11: return std::pow(2.0, 10.0 * (t - 1.0));
-            case 12: return 1.0 - std::pow(2.0, -10.0 * t);
-            case 13: return -0.5 * (std::cos(PI * t) - 1.0);
-            case 14: return 1.0 - std::cos(t * PI / 2.0);
-            case 15: return std::sin(t * PI / 2.0);
-            case 16: {
-                double o = BACK * 1.525;
-                double u = t * 2.0;
-                if (u < 1.0) {
-                    return u * u * ((o + 1.0) * u - o) / 2.0;
-                }
-                u -= 2.0;
-                return u * u * ((o + 1.0) * u + o) / 2.0 + 1.0;
-            }
-            case 17: return t * t * ((BACK + 1.0) * t - BACK);
-            case 18: {
-                double u = t - 1.0;
-                return u * u * ((BACK + 1.0) * u + BACK) + 1.0;
-            }
-            default: return t;
-        }
-    }
-
-    bool plainTrigger(EffectGameObject* t, bool rotate) {
-        if (t->m_targetGroupID <= 0 || t->m_isDynamicMode) {
-            return false;
-        }
-        if (rotate) {
-            return t->m_rotationTargetID <= 0 && (t->m_rotationDegrees != 0.f || t->m_times360 != 0);
-        }
-        return !t->m_useMoveTarget && !t->m_lockToPlayerX && !t->m_lockToPlayerY && !t->m_lockToCameraX && !t->m_lockToCameraY &&
-            (t->m_moveOffset.x != 0.f || t->m_moveOffset.y != 0.f);
-    }
-
-    // v2.85: a spawn trigger the prediction can follow: no random delay, no remapped groups, not ordered
-    bool plainSpawn(EffectGameObject* t) {
-        auto* s = static_cast<SpawnTriggerGameObject*>(t);
-        return t->m_targetGroupID > 0 && s->m_delayRange <= 0.f && s->m_remapObjects.empty() && !t->m_spawnOrdered;
-    }
-
-    int spawnSteps(EffectGameObject* t, float tickLength) {
-        return static_cast<int>(std::lround(std::max(0.f, static_cast<SpawnTriggerGameObject*>(t)->m_spawnDelay) * 60.0 / tickLength));
-    }
-
-    // the level's move / rotate / toggle / spawn triggers, found once per level (and again if
-    // objects were added)
-    void scanMoveTriggers(GJBaseGameLayer* layer) {
-        unsigned count = layer->m_objects ? layer->m_objects->count() : 0;
-        if (layer == levelTriggersLayer && count == levelTriggersCount) {
-            return;
-        }
-        levelTriggersLayer = layer;
-        levelTriggersCount = count;
-        levelTriggers.clear();
-        if (!layer->m_objects) {
-            return;
-        }
-        for (auto* object : CCArrayExt<GameObject*>(layer->m_objects)) {
-            if (!object) {
-                continue;
-            }
-            int id = object->m_objectID;
-            if (id != 901 && id != 1346 && id != 1049 && id != 1268) {
-                continue;
-            }
-            auto* t = static_cast<EffectGameObject*>(object);
-            if (t->m_isSpawnTriggered || t->m_isTouchTriggered) {
-                continue;
-            }
-            if (id == 1049) {
-                if (t->m_targetGroupID > 0) {
-                    levelTriggers.push_back({ t, t->m_positionX, TriggerKind::Toggle });  // v2.85: on too
-                }
-                continue;
-            }
-            if (id == 1268) {
-                if (plainSpawn(t)) {
-                    levelTriggers.push_back({ t, t->m_positionX, TriggerKind::Spawn });
-                }
-                continue;
-            }
-            bool rotate = id == 1346;
-            if (plainTrigger(t, rotate)) {
-                levelTriggers.push_back({ t, t->m_positionX, rotate ? TriggerKind::Rotate : TriggerKind::Move });
-            }
-        }
-        std::sort(levelTriggers.begin(), levelTriggers.end(), [](auto const& a, auto const& b) { return a.x < b.x; });
-    }
-
-    // a move / rotate trigger's motion: offset or angle (and center), duration, easing
-    // a group's group parent (set in the editor), or nullptr
-    GameObject* groupParentOf(GJBaseGameLayer* layer, int group) {
-        if (group <= 0 || !layer->m_parentGroupsDict) {
-            return nullptr;
-        }
-        return typeinfo_cast<GameObject*>(layer->m_parentGroupsDict->objectForKey(group));
-    }
-
-    void fillMove(GJBaseGameLayer* layer, EffectGameObject* t, TriggerKind kind, float tickLength, ScriptedMove& m) {
-        m.kind = kind;
-        m.steps = t->m_duration * 60.0 / tickLength;
-        m.easing = static_cast<int>(t->m_easingType);
-        m.rate = t->m_easingRate;
-        if (kind == TriggerKind::Move) {
-            m.dx = t->m_moveOffset.x;
-            m.dy = t->m_moveOffset.y;
-            return;
-        }
-        m.angle = t->m_rotationDegrees + 360.0 * t->m_times360;
-        m.lockRot = t->m_lockObjectRotation;
-        // v2.84.5: the pivot is the center group's group parent (or its first object); with no
-        // center group, the target group's group parent, and only without one does each object
-        // turn in place (ORBIT's saws orbit their group parent: they were predicted spinning in place)
-        GameObject* pivot = nullptr;
-        if (t->m_centerGroupID > 0) {
-            pivot = groupParentOf(layer, t->m_centerGroupID);
-            if (!pivot) {
-                auto* center = layer->getGroup(t->m_centerGroupID);
-                if (center && center->count() > 0) {
-                    pivot = static_cast<GameObject*>(center->objectAtIndex(0));
-                }
-            }
-        }
-        else {
-            pivot = groupParentOf(layer, t->m_targetGroupID);
-        }
-        if (pivot) {
-            m.hasCenter = true;
-            m.cx = pivot->m_positionX;
-            m.cy = pivot->m_positionY;
-        }
-    }
-
-    // fraction f of move m applied to a position (and an object's own turn)
-    void applyMove(ScriptedMove const& m, double f, double& x, double& y, double& spin) {
-        if (m.kind == TriggerKind::Move) {
-            x += m.dx * f;
-            y += m.dy * f;
-            return;
-        }
-        if (m.kind != TriggerKind::Rotate) {
-            return;
-        }
-        double a = m.angle * f;
-        if (m.hasCenter) {
-            // clockwise around the center (y up)
-            double th = -a * 3.141592653589793 / 180.0;
-            double rx = x - m.cx, ry = y - m.cy;
-            x = m.cx + rx * std::cos(th) - ry * std::sin(th);
-            y = m.cy + rx * std::sin(th) + ry * std::cos(th);
-        }
-        if (!m.lockRot) {
-            spin += a;
-        }
-    }
-
-    // v2.84 trigger self-check: when a real move / rotate trigger fires, one of its objects
-    // near you is watched for up to half a second, and where it really ends up is compared with
-    // where the prediction would have put it. If this level's triggers keep coming out wrong,
-    // trigger prediction turns itself off for the level.
-    // v2.84.2: the prediction for the watched object is the combined motion of EVERY move /
-    // rotate trigger that acted on any of its groups in that time (ORBIT moves almost every
-    // block with several triggers at once, so v2.84.1 skipped every check). Only when a trigger
-    // the prediction can't model acted on it (follow, keyframes, target / lock moves...) is
-    // the check left out.
-    struct TriggerCheck {
-        GameObject* object;
-        int fired;
-        int at;
-        double x, y, rot;
-    };
-    std::vector<TriggerCheck> triggerChecks;
-    int checksGood = 0, checksBad = 0, checksUnclear = 0;
-    bool triggersDistrusted = false;
-    int attemptStartTick = 0;  // v2.84.3
-    // every trigger with a target group the real game fired lately, and when
-    struct TriggerFire {
-        EffectGameObject* trigger;
-        int tick;
-        ScriptedMove move;  // v2.84.5: filled when it fired (the pivot where it was then)
-    };
-    std::vector<TriggerFire> triggerFires;
-
-    void noteTriggerFire(GJBaseGameLayer* layer, EffectGameObject* t) {
-        if (t->m_targetGroupID <= 0) {
-            return;
-        }
-        if (triggerFires.size() > 1024) {
-            triggerFires.erase(triggerFires.begin(), triggerFires.begin() + 512);
-        }
-        ScriptedMove m;
-        int id = t->m_objectID;
-        if (layer && (id == 901 || id == 1346)) {
-            float tickLength = buf.tickLength > 0.001f && buf.tickLength < 2.f ? buf.tickLength : TICK;
-            fillMove(layer, t, id == 1346 ? TriggerKind::Rotate : TriggerKind::Move, tickLength, m);
-        }
-        triggerFires.push_back({ t, tickCount, m });
-    }
-
-    // triggers that move objects in ways the prediction doesn't model
-    bool unmodeledMover(int id) {
-        switch (id) {
-            case 1347:  // follow
-            case 1814:  // follow player Y
-            case 2067:  // scale
-            case 3016:  // advanced follow
-            case 3033:  // keyframe animation
-            case 3006: case 3007: case 3008: case 3009: case 3010:  // area move / rotate / scale / fade / tint
-                return true;
-            default:
-                return false;
-        }
-    }
-
-    bool inGroups(GameObject* object, int group) {
-        auto* groups = object->m_groups;
-        int count = std::clamp<int>(object->m_groupCount, 0, 10);
-        if (!groups || group <= 0) {
-            return false;
-        }
-        for (int i = 0; i < count; ++i) {
-            if ((*groups)[i] == group) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    void startTriggerCheck(GJBaseGameLayer* layer, EffectGameObject* t) {
-        // v2.84.3: checks keep running while trigger prediction is off, so it can come back on;
-        // triggers in the first quarter second of an attempt (level setup) aren't checked
-        if (!buf.predictTriggers || triggerChecks.size() >= 16 || !layer || !layer->m_player1 || tickCount - attemptStartTick < st(60)) {
-            return;
-        }
-        bool rotate = t->m_objectID == 1346;
-        if (!plainTrigger(t, rotate) || t->m_duration * 60.f < TICK) {
-            return;
-        }
-        auto* group = layer->getGroup(t->m_targetGroupID);
-        if (!group) {
-            return;
-        }
-        float tickLength = buf.tickLength > 0.001f && buf.tickLength < 2.f ? buf.tickLength : TICK;
-        double px = layer->m_player1->getPositionX();
-        for (auto* object : CCArrayExt<GameObject*>(group)) {
-            if (!object || object == t || object->m_isDecoration || object->m_objectType == GameObjectType::Decoration ||
-                object->m_positionX < px - 150.0 || object->m_positionX > px + 700.0) {
-                continue;
-            }
-            for (auto const& c : triggerChecks) {
-                if (c.object == object) {
-                    return;  // already watched
-                }
-            }
-            int span = std::min(static_cast<int>(std::lround(t->m_duration * 60.0 / tickLength)), st(120));
-            triggerChecks.push_back({ object, tickCount, tickCount + std::max(span, 1), object->m_positionX, object->m_positionY,
-                static_cast<double>(object->getRotationX()) });
-            return;
-        }
-    }
-
-    void forgetTriggerChecks() {
-        triggerChecks.clear();
-        triggerFires.clear();
-        checksGood = checksBad = checksUnclear = 0;
-        triggersDistrusted = false;
-    }
-
-    // where the prediction says the object is now: every modeled trigger on its groups, each
-    // from when the check started (or it fired) to now. nullptr = predicted, else why not.
-    char const* predictCheck(GJBaseGameLayer* layer, TriggerCheck const& c, double& x, double& y, double& spin, int& used,
-        std::string* detail = nullptr) {
-        float tickLength = buf.tickLength > 0.001f && buf.tickLength < 2.f ? buf.tickLength : TICK;
-        x = c.x;
-        y = c.y;
-        spin = 0.0;
-        used = 0;
-        for (auto const& f : triggerFires) {
-            if (f.tick > c.at || !inGroups(c.object, f.trigger->m_targetGroupID)) {
-                continue;
-            }
-            int id = f.trigger->m_objectID;
-            if (unmodeledMover(id)) {
-                if (f.tick >= c.fired - st(240)) {
-                    return "a follow / keyframe / area trigger moves it";
-                }
-                continue;
-            }
-            if (id != 901 && id != 1346) {
-                continue;
-            }
-            ScriptedMove m = f.move;
-            bool rotate = id == 1346;
-            int start = std::max(c.fired, f.tick);
-            if (m.steps >= 0.5 && f.tick + m.steps <= c.fired) {
-                continue;  // finished before the check started
-            }
-            if (!plainTrigger(f.trigger, rotate)) {
-                return "a target / lock-to-player move moves it";
-            }
-            double done = m.steps < 0.5 ? 1.0 : easeMove(m.easing, m.rate, (c.at - f.tick) / m.steps);
-            double before = m.steps < 0.5 ? (f.tick < c.fired ? 1.0 : 0.0) : easeMove(m.easing, m.rate, (start - f.tick) / m.steps);
-            applyMove(m, done - before, x, y, spin);
-            ++used;
-            if (detail) {
-                // v2.84.4: what each trigger was, for misses: id, offset or angle, duration, easing
-                auto* t = f.trigger;
-                *detail += rotate ? fmt::format(" | rotate {:g}deg{}{} {:.2f}s e{}/{:g}", m.angle, m.hasCenter ? " around center" : " in place",
-                                        m.lockRot ? " locked" : "", t->m_duration, m.easing, m.rate)
-                                  : fmt::format(" | move {:g},{:g}{}{} {:.2f}s e{}/{:g}", m.dx, m.dy, t->m_smallStep ? " smallstep" : "",
-                                        t->m_isSilent ? " silent" : "", t->m_duration, m.easing, m.rate);
-                *detail += fmt::format(" from t{}", f.tick - c.fired);
-            }
-        }
-        return nullptr;
-    }
-
-    void runTriggerChecks(GJBaseGameLayer* layer) {
-        for (auto it = triggerChecks.begin(); it != triggerChecks.end();) {
-            auto const& c = *it;
-            if (tickCount < c.fired) {
-                it = triggerChecks.erase(it);
-                continue;
-            }
-            if (tickCount < c.at) {
-                ++it;
-                continue;
-            }
-            double x, y, spin;
-            int used;
-            std::string detail;
-            char const* unclear = predictCheck(layer, c, x, y, spin, used, buf.explain ? &detail : nullptr);
-            double moved = std::hypot(c.object->m_positionX - c.x, c.object->m_positionY - c.y);
-            double turned = std::abs(std::remainder(c.object->getRotationX() - c.rot, 360.0));
-            if (!unclear && moved < 0.5 && turned < 0.5) {
-                unclear = "it didn't move";  // not updated yet, or a stop trigger
-            }
-            if (unclear) {
-                ++checksUnclear;
-                if (buf.explain && checksUnclear % 10 == 1) {
-                    say("trigger check: unclear ({}), {} unclear so far", unclear, checksUnclear);
-                }
-                it = triggerChecks.erase(it);
-                continue;
-            }
-            double err = std::hypot(c.object->m_positionX - x, c.object->m_positionY - y);
-            double tol = std::max(3.0, std::hypot(x - c.x, y - c.y) * 0.1);
-            double turnErr = std::abs(std::remainder(c.object->getRotationX() - (c.rot + spin), 360.0));
-            bool ok = err <= tol && turnErr <= std::max(5.0, std::abs(spin) * 0.1);
-            ok ? ++checksGood : ++checksBad;
-            if (buf.explain) {
-                say("trigger check: {} the prediction ({} trigger{}, off by {:.1f}u {:.0f} deg | {} hit / {} missed / {} unclear)",
-                    ok ? "matches" : "DOESN'T match", used, used == 1 ? "" : "s", err, turnErr, checksGood, checksBad, checksUnclear);
-                if (!ok) {
-                    // v2.84.4: expected vs real movement and the triggers involved
-                    say("  obj {} expected moved {:.1f},{:.1f} turned {:.0f} | really moved {:.1f},{:.1f} turned {:.0f} over {}t{}",
-                        c.object->m_objectID, x - c.x, y - c.y, spin, c.object->m_positionX - c.x, c.object->m_positionY - c.y,
-                        std::remainder(c.object->getRotationX() - c.rot, 360.0), c.at - c.fired, detail);
-                }
-            }
-            // v2.84.3: decided on 10+ checks, and it comes back on if hits catch up (ORBIT went
-            // off at 1 hit / 5 missed from level-start triggers, then ended at 9 hit / 8 missed)
-            bool wrong = checksGood + checksBad >= 10 && checksBad > 2 * checksGood;
-            if (wrong != triggersDistrusted) {
-                triggersDistrusted = wrong;
-                if (wrong) {
-                    say("trigger check: {} of {} trigger predictions were wrong on this level, trigger prediction is off here", checksBad,
-                        checksBad + checksGood);
-                }
-                else {
-                    say("trigger check: {} of {} wrong now, trigger prediction is back on", checksBad, checksBad + checksGood);
-                }
-            }
-            it = triggerChecks.erase(it);
-        }
-    }
-
-    // the triggers this prediction can reach, and the objects they move
-    void collectScripted(GJBaseGameLayer* layer, int total) {
-        scriptedMoves.clear();
-        scriptedObjects.clear();
-        buf.triggersAhead = 0;
-        if (!buf.predictTriggers || triggersDistrusted || !buf.ghost1 || !layer->m_player1 || layer->m_player1->m_isGoingLeft) {
-            return;
-        }
-        double px = buf.ghost1->getPositionX();
-        double py = buf.ghost1->getPositionY();
-        double reach = (total + 2) * std::max(static_cast<double>(std::abs(buf.tickDx)), 2.0) + 30.0;
-        auto& cache = scriptedCache;
-        if (cache.layer == layer && cache.tick == tickCount && reach <= cache.reach && std::abs(px - cache.px) < 3.0) {
-            scriptedMoves = cache.moves;
-            scriptedObjects = cache.objects;
-            buf.triggersAhead = static_cast<int>(scriptedMoves.size());
-            return;
-        }
-        scanMoveTriggers(layer);
-        float tickLength = buf.tickLength > 0.001f && buf.tickLength < 2.f ? buf.tickLength : TICK;
-        std::unordered_map<GameObject*, size_t> index;
-        // v2.84.4: only objects whose motion can come near the ghost's path (it was every object
-        // within ~800 units either side, at any height)
-        double pathMinX = px - 90.0, pathMaxX = px + reach + 90.0;
-        double pathMinY = py - 450.0, pathMaxY = py + 450.0;
-        auto nearPath = [&](GameObject* object, ScriptedMove const& m) {
-            double x = object->m_positionX, y = object->m_positionY;
-            double x0 = x, x1 = x, y0 = y, y1 = y;
-            if (m.kind == TriggerKind::Move) {
-                x0 = std::min(x, x + m.dx);
-                x1 = std::max(x, x + m.dx);
-                y0 = std::min(y, y + m.dy);
-                y1 = std::max(y, y + m.dy);
-            }
-            else if (m.hasCenter) {
-                double r = std::hypot(x - m.cx, y - m.cy);
-                x0 = m.cx - r;
-                x1 = m.cx + r;
-                y0 = m.cy - r;
-                y1 = m.cy + r;
-            }
-            constexpr double SIZE = 60.0;  // the object's own size
-            return x1 + SIZE >= pathMinX && x0 - SIZE <= pathMaxX && y1 + SIZE >= pathMinY && y0 - SIZE <= pathMaxY;
-        };
-        // adds trigger t: armed = it fires at step `when` (negative: it fired that long ago),
-        // else when the ghost gets to x, `when` steps later (a spawn delay)
-        auto addMove = [&](EffectGameObject* t, double x, TriggerKind kind, bool armed, int when) {
-            int elapsed = armed && when < 0 ? -when : -1;
-            if (static_cast<int>(scriptedMoves.size()) >= SCRIPTED_TRIGGER_LIMIT) {
-                return;
-            }
-            auto* group = layer->getGroup(t->m_targetGroupID);
-            if (!group || group->count() == 0) {
-                return;
-            }
-            ScriptedMove m;
-            m.kind = kind;
-            m.x = x;
-            m.armed = armed;
-            m.fireStep = armed ? when : -1;
-            m.delay = armed ? 0 : when;
-            if (kind == TriggerKind::Toggle) {
-                m.group = group;
-                m.on = t->m_activateGroup;
-                scriptedMoves.push_back(m);
-                return;
-            }
-            fillMove(layer, t, kind, tickLength, m);
-            if (elapsed >= 0) {
-                if (m.steps < 0.5 || elapsed >= m.steps) {
-                    return;  // already finished
-                }
-                m.from = easeMove(m.easing, m.rate, elapsed / m.steps);
-            }
-            int move = static_cast<int>(scriptedMoves.size());
-            bool any = false;
-            for (auto* object : CCArrayExt<GameObject*>(group)) {
-                if (!object || object == t || object->m_isDecoration || object->m_objectType == GameObjectType::Decoration ||
-                    !nearPath(object, m)) {
-                    continue;
-                }
-                auto [found, added] = index.try_emplace(object, scriptedObjects.size());
-                if (added) {
-                    if (scriptedObjects.size() >= SCRIPTED_OBJECT_LIMIT) {
-                        index.erase(found);
-                        continue;
-                    }
-                    bool mover = std::any_of(movers.begin(), movers.end(), [&](Mover const& mv) { return mv.object == object; });
-                    scriptedObjects.push_back({ object, object->m_positionX, object->m_positionY, object->getPosition(),
-                        object->getRotationX(), object->getRotationY(), mover });
-                }
-                scriptedObjects[found->second].moves.push_back(move);
-                any = true;
-            }
-            if (any) {
-                scriptedMoves.push_back(m);
-            }
-        };
-        // moves / rotations already running (with "predict moving objects" on, those are
-        // extrapolated instead)
-        if (!buf.predictMovers) {
-            for (auto fired = firedMoves.begin(); fired != firedMoves.end();) {
-                auto* t = fired->first;
-                int elapsed = tickCount - fired->second;
-                if (elapsed < 0 || elapsed * tickLength > t->m_duration * 60.f + 1.f) {
-                    fired = firedMoves.erase(fired);
-                    continue;
-                }
-                bool rotate = t->m_objectID == 1346;
-                if (plainTrigger(t, rotate)) {
-                    addMove(t, 0.0, rotate ? TriggerKind::Rotate : TriggerKind::Move, true, -elapsed);
-                }
-                ++fired;
-            }
-        }
-        // v2.85: what spawning a group sets off: its spawn-triggered move / rotate / toggle
-        // triggers, and its spawn triggers in turn (with their delays, 4 deep)
-        std::function<void(int, double, bool, int, int)> spawnChain = [&](int groupID, double x, bool armed, int when, int depth) {
-            auto* group = layer->getGroup(groupID);
-            if (!group || depth > 4) {
-                return;
-            }
-            int seen = 0;
-            for (auto* object : CCArrayExt<GameObject*>(group)) {
-                if (!object || ++seen > 600) {
-                    break;
-                }
-                int id = object->m_objectID;
-                if (id != 901 && id != 1346 && id != 1049 && id != 1268) {
-                    continue;
-                }
-                auto* c = static_cast<EffectGameObject*>(object);
-                if (!c->m_isSpawnTriggered) {
-                    continue;
-                }
-                if (id == 1268) {
-                    if (plainSpawn(c)) {
-                        spawnChain(c->m_targetGroupID, x, armed, when + spawnSteps(c, tickLength), depth + 1);
-                    }
-                }
-                else if (id == 1049) {
-                    if (c->m_targetGroupID > 0) {
-                        addMove(c, x, TriggerKind::Toggle, armed, when);
-                    }
-                }
-                else if (plainTrigger(c, id == 1346)) {
-                    addMove(c, x, id == 1346 ? TriggerKind::Rotate : TriggerKind::Move, armed, when);
-                }
-            }
-        };
-        // groups the real game will spawn shortly (a spawn trigger with a delay already fired)
-        if (!pendingSpawns.empty()) {
-            std::erase_if(pendingSpawns, [](PendingSpawn const& p) { return p.at < tickCount; });
-            for (auto const& p : pendingSpawns) {
-                spawnChain(p.group, 0.0, true, p.at - tickCount, 0);
-            }
-        }
-        // the ones the ghost will set off
-        auto it = std::lower_bound(levelTriggers.begin(), levelTriggers.end(), px - 2.0, [](auto const& m, double x) { return m.x < x; });
-        for (; it != levelTriggers.end() && it->x <= px + reach; ++it) {
-            if (it->trigger->m_activated) {
-                continue;
-            }
-            if (it->kind == TriggerKind::Spawn) {
-                spawnChain(it->trigger->m_targetGroupID, it->x, false, spawnSteps(it->trigger, tickLength), 0);
-            }
-            else {
-                addMove(it->trigger, it->x, it->kind, false, 0);
-            }
-        }
-        buf.triggersAhead = static_cast<int>(scriptedMoves.size());
-        if (scriptedMoves.empty()) {
-            scriptedObjects.clear();
-        }
-        cache.layer = layer;
-        cache.tick = tickCount;
-        cache.px = px;
-        cache.reach = reach;
-        cache.moves = scriptedMoves;
-        cache.objects = scriptedObjects;
-    }
-
-    // v2.85: a toggle in this prediction: off = the ghost stops colliding with the group, on =
-    // switched-off objects in it collide again (see collisionCheckObjects)
-    void simToggle(CCArray* group, bool on) {
-        int seen = 0;
-        for (auto* object : CCArrayExt<GameObject*>(group)) {
-            if (!object || ++seen > 2000) {
-                break;
-            }
-            if (!on) {
-                buf.simDisabled.insert(object);
-                continue;
-            }
-            buf.simDisabled.erase(object);
-            if (object->m_isGroupDisabled && buf.simEnabled.size() < 256 &&
-                std::find(buf.simEnabled.begin(), buf.simEnabled.end(), object) == buf.simEnabled.end()) {
-                buf.simEnabled.push_back(object);
-            }
-        }
-    }
-
-    // the ghost reached x: triggers there go off (v2.85: after their spawn delay); a toggle
-    // switches its group off (or on) for the rest of this prediction
-    void fireScripted(double gx, int tick) {
-        for (auto& m : scriptedMoves) {
-            if (!m.armed && gx >= m.x) {
-                m.armed = true;
-                m.fireStep = tick + m.delay;
-            }
-            if (m.kind == TriggerKind::Toggle && m.armed && !m.toggled && tick >= m.fireStep && m.group) {
-                m.toggled = true;
-                simToggle(m.group, m.on);
-            }
-        }
-    }
-
-    // where the triggered objects are `step` steps into the prediction
-    void placeScripted(int step) {
-        for (auto& o : scriptedObjects) {
-            double x = o.mover ? o.object->m_positionX : o.x;
-            double y = o.mover ? o.object->m_positionY : o.y;
-            double spin = 0.0;
-            bool any = false;
-            for (int i : o.moves) {
-                auto const& m = scriptedMoves[i];
-                if (!m.armed || step <= m.fireStep) {
-                    continue;
-                }
-                double f = (m.steps < 0.5 ? 1.0 : easeMove(m.easing, m.rate, (step - m.fireStep) / m.steps)) - m.from;
-                if (f == 0.0) {
-                    continue;
-                }
-                any = true;
-                applyMove(m, f, x, y, spin);
-            }
-            if (!any && !o.placed) {
-                continue;
-            }
-            // v2.84.5: a finished (or instant) move leaves it where it was last step: nothing to do
-            if (o.placed && !o.mover && x == o.lastX && y == o.lastY && spin == o.lastSpin) {
-                continue;
-            }
-            o.lastX = x;
-            o.lastY = y;
-            o.lastSpin = spin;
-            o.object->setPosition({ static_cast<float>(x), static_cast<float>(y) });
-            o.object->m_positionX = x;
-            o.object->m_positionY = y;
-            if (!o.mover && (spin != 0.0 || o.rotated)) {
-                o.object->setRotationX(static_cast<float>(o.rotX + spin));
-                o.object->setRotationY(static_cast<float>(o.rotY + spin));
-                o.rotated = true;
-            }
-            o.object->setObjectRectDirty(true);
-            o.object->m_isOrientedBoxDirty = true;
-            o.placed = true;
-        }
-    }
-
-    void restoreScripted() {
-        for (auto& o : scriptedObjects) {
-            if (o.placed && !o.mover) {
-                o.object->setPosition(o.node);
-                o.object->m_positionX = o.x;
-                o.object->m_positionY = o.y;
-                if (o.rotated) {
-                    o.object->setRotationX(o.rotX);
-                    o.object->setRotationY(o.rotY);
-                }
-                o.object->setObjectRectDirty(true);
-                o.object->m_isOrientedBoxDirty = true;
-            }
-        }
-        scriptedObjects.clear();
-        scriptedMoves.clear();
     }
 
     // v2.4 drift check: the ghost run for the input you actually made is recorded, then
@@ -2183,17 +1628,38 @@ namespace {
         return memory.size();
     }
 
+    // v2.87.1: a failed write is logged once (until it works again). The data stays "dirty", so the
+    // next save retries; before, the file was cut to zero in place and marked clean unchecked.
+    std::unordered_set<std::string> ioWarned;
+    void ioFailed(std::string const& what, std::string const& err) {
+        if (ioWarned.insert(what).second) {
+            say("could not save {} ({}); will retry", what, err);
+        }
+    }
+    void ioOk(std::string const& what) {
+        if (ioWarned.erase(what) > 0) {
+            say("{} saved again", what);
+        }
+    }
+
     void saveMemory() {
         if (!memoryDirty || memoryKey.empty()) {
             return;
         }
         std::error_code ec;
         std::filesystem::create_directories(memoryFile().parent_path(), ec);
-        std::ofstream out(memoryFile(), std::ios::trunc);
+        std::ostringstream out;
         for (auto const& [slice, spot] : memory) {
             out << slice << ' ' << spot.ok << ' ' << spot.bad << ' ' << spot.deaths << ' ' << spot.delaySum << ' ' << spot.last << '\n';
         }
-        memoryDirty = false;
+        std::string err;
+        if (cfg::writeFileAtomic(memoryFile(), out.str(), &err)) {
+            memoryDirty = false;
+            ioOk("level memory");
+        }
+        else {
+            ioFailed("level memory", err);
+        }
     }
 
     void loadMemory(GJGameLevel* level) {
@@ -2353,13 +1819,13 @@ namespace {
         if (!buf.learn) {
             return 0;
         }
-        for (int s : { slice, slice - 1, slice + 1 }) {
-            auto it = memory.find(s);
+        for (int sl : { slice, slice - 1, slice + 1 }) {
+            auto it = memory.find(sl);
             if (it != memory.end() && it->second.last > 0) {
                 return st(static_cast<int>(it->second.last));
             }
         }
-        auto spot = spotAround(slice);  // older files: no last delay yet, the average
+        auto spot = spotAround(slice);  // older lines: no last delay yet, the average
         if (spot.ok < 2) {
             return 0;
         }
@@ -2382,65 +1848,23 @@ namespace {
             s.activated = effect->m_activated;
             s.byP1 = effect->m_activatedByPlayer1;
             s.byP2 = effect->m_activatedByPlayer2;
-            s.animated = effect->m_animationTriggered;
         }
         buf.snapshots.push_back(s);
     }
 
-    // v2.88: anything a ghost added to the real level during a prediction (the dash start
-    // effect of dash orbs, bursts...) is removed afterwards. Dash orbs still flashed before
-    // you reached them: those effects go onto the level's layers, not the ghost's own.
-    struct NodeMark {
-        CCNode* node;
-        unsigned count;
-    };
-    std::vector<NodeMark> levelMarks;
-
-    void markLevelNodes(PlayLayer* layer) {
-        levelMarks.clear();
-        auto add = [](CCNode* n) {
-            if (n) {
-                levelMarks.push_back({ n, n->getChildrenCount() });
-            }
-        };
-        add(layer);
-        add(layer->m_objectLayer);
-        if (layer->m_aboveShaderObjectLayer != layer->m_objectLayer) {
-            add(layer->m_aboveShaderObjectLayer);
-        }
-        if (layer->m_objectLayer && layer->m_objectLayer->getChildren()) {
-            for (auto* child : CCArrayExt<CCNode*>(layer->m_objectLayer->getChildren())) {
-                add(child);
-            }
-        }
-    }
-
-    void sweepLevelNodes() {
-        for (auto const& m : levelMarks) {
-            auto* kids = m.node->getChildren();
-            while (kids && kids->count() > m.count) {
-                m.node->removeChild(static_cast<CCNode*>(kids->lastObject()), true);
-            }
-        }
-        levelMarks.clear();
-    }
-
     void restoreObjects() {
-        sweepLevelNodes();
         for (auto const& s : buf.snapshots) {
             s.object->m_isActivated = s.isActivated;
             if (s.effect) {
                 s.effect->m_activated = s.activated;
                 s.effect->m_activatedByPlayer1 = s.byP1;
                 s.effect->m_activatedByPlayer2 = s.byP2;
-                s.effect->m_animationTriggered = s.animated;
             }
         }
         buf.snapshots.clear();
         buf.simUsed.clear();
         buf.orbsUsed.clear();
         buf.simDisabled.clear();
-        buf.simEnabled.clear();
     }
 
     void advanceGhost(PlayerObject* ghost, float dt) {
@@ -2454,6 +1878,39 @@ namespace {
         ghost->m_collisionLogLeft->removeAllObjects();
         ghost->m_collisionLogRight->removeAllObjects();
         layer->checkCollisions(ghost, dt, false);
+    }
+
+    // v2.79: the ghost goes through a mode portal the way the player would (no effects).
+    // Mode flags are copied from the real player before every run, so nothing leaks.
+    void setGhostMode(PlayerObject* ghost, GameObjectType type) {
+        using T = GameObjectType;
+        bool now = (type == T::ShipPortal && ghost->m_isShip) || (type == T::BallPortal && ghost->m_isBall) ||
+            (type == T::UfoPortal && ghost->m_isBird) || (type == T::WavePortal && ghost->m_isDart) ||
+            (type == T::RobotPortal && ghost->m_isRobot) || (type == T::SpiderPortal && ghost->m_isSpider) ||
+            (type == T::SwingPortal && ghost->m_isSwing) ||
+            (type == T::CubePortal && !ghost->m_isShip && !ghost->m_isBall && !ghost->m_isBird && !ghost->m_isDart &&
+                !ghost->m_isRobot && !ghost->m_isSpider && !ghost->m_isSwing);
+        if (now) {
+            return;
+        }
+        buf.ghostSwitched = true;
+        if (ghost->m_isShip) ghost->toggleFlyMode(false, true);
+        if (ghost->m_isBall) ghost->toggleRollMode(false, true);
+        if (ghost->m_isBird) ghost->toggleBirdMode(false, true);
+        if (ghost->m_isDart) ghost->toggleDartMode(false, true);
+        if (ghost->m_isRobot) ghost->toggleRobotMode(false, true);
+        if (ghost->m_isSpider) ghost->toggleSpiderMode(false, true);
+        if (ghost->m_isSwing) ghost->toggleSwingMode(false, true);
+        switch (type) {
+            case T::ShipPortal: ghost->toggleFlyMode(true, true); break;
+            case T::BallPortal: ghost->toggleRollMode(true, true); break;
+            case T::UfoPortal: ghost->toggleBirdMode(true, true); break;
+            case T::WavePortal: ghost->toggleDartMode(true, true); break;
+            case T::RobotPortal: ghost->toggleRobotMode(true, true); break;
+            case T::SpiderPortal: ghost->toggleSpiderMode(true, true); break;
+            case T::SwingPortal: ghost->toggleSwingMode(true, true); break;
+            default: break;
+        }
     }
 
     bool isFlying(PlayerObject* player) {
@@ -2489,21 +1946,19 @@ namespace {
             return horizon;
         }
         buf.simulating = true;
-        markLevelNodes(layer);
         buf.ghostDied = false;
         buf.ghostHitPortal = false;
-        buf.ghostSwitched = false;
-        buf.ghostSolo = false;
         buf.firstOrbTick = -1;
         buf.lastOrbTick = -1;
         buf.laterOrbTouched = false;
         buf.orbUsedTick = -1;
 
         bool second = dual && buf.ghost2 && p2;
-        buf.simSecond = second;
         buf.haveRealRect = buf.ignoreTouching;
         buf.harmless.clear();
-        // v2.78.1: always known, so mode portals you're still inside are skipped (see
+        buf.harmless2.clear();
+        buf.ghostSwitched = false;
+        // v2.79: always known, so mode portals you're still inside are skipped (see
         // collisionCheckObjects)
         buf.haveStartRects = true;
         buf.realRect1 = p1->getObjectRect();
@@ -2553,16 +2008,9 @@ namespace {
         bool safe = false;
 
         collectMovers();
-        collectScripted(layer, total);
         for (; tick < total; ++tick) {
-            second = buf.simSecond;  // v2.84: after a solo portal only P1 goes on (v2.85: after a dual portal both)
             if (!movers.empty()) {
                 placeMovers(tick + 1);  // where they'll be after this step
-            }
-            if (!scriptedMoves.empty()) {
-                // v2.81: a move / rotate / toggle trigger the ghost has reached goes off
-                fireScripted(buf.ghost1->getPositionX(), tick);
-                placeScripted(tick + 1);
             }
             buf.simTick = tick;
             // v2.26: orb auto-clicks that wait a few ticks into the orb fire here, if the
@@ -2674,7 +2122,6 @@ namespace {
                 }
                 continue;
             }
-            // v2.61: v2.48 landing rule (the v2.51 ceiling-bump shortcut is gone)
             if (airTicks < st(ballRun ? 2 : 6)) {
                 continue;
             }
@@ -2685,13 +2132,12 @@ namespace {
             ++groundTicks;
         }
 
-        restoreScripted();
         if (!movers.empty()) {
             placeMovers(0);  // back exactly where they were
             movers.clear();
         }
         ++buf.simRuns;
-        buf.simTicks += tick + 1;
+        buf.simTicks += std::min(tick + 1, total);  // v2.87.1: tick == total when the loop ran to the end (was one too many)
 
         // Died or hit an unsimulated portal before the delayed input even fired:
         // longer delays can't do better, stop searching.
@@ -2703,7 +2149,7 @@ namespace {
         if (buf.ghost2) {
             buf.ghost2->stopAllActions();
         }
-        // v2.78.3: a ghost that used an orb or dashed started its particles (orb burst, dash
+        // v2.79: a ghost that used an orb or dashed started its particles (orb burst, dash
         // fire) right where the orb is, before you got there
         if (buf.firstOrbTick >= 0) {
             buf.ghost1->stopParticles();
@@ -2711,7 +2157,6 @@ namespace {
                 buf.ghost2->stopParticles();
             }
         }
-        buf.lastRunSwitched = buf.ghostSwitched;
         buf.simulating = false;
         return safe ? horizon : survived;
     }
@@ -2719,31 +2164,24 @@ namespace {
     // v2.4: simulate() with the orb setting; if that run touched an orb and didn't make
     // it, also try the other choice (click it / skip it) and keep whichever lives longer,
     // like a player who only clicks the orb when they need it.
-    // v2.57: hard time cap for one click's whole decision. The search loops have their own
-    // budget, but orb clicks also ran unbudgeted work (orb alignment, the both-ways and late
-    // orb clicks in every run, robust and more-time checks) and could take several frames.
+    // v2.70: when the current click started being processed.
+    // v2.79: the whole click shares its time: each search used to get the full budget on its
+    // own, on top of the base run, memory try and orb checks before it, so a wave save on
+    // GRIEF could take 2-3 frames at 240 fps. Orb retries stop once the click is over time.
     std::chrono::steady_clock::time_point clickStart;
     bool clickTimed = false;
 
-    // v2.70: how long the current click has been processed so far (0 outside a click)
     double clickMs() {
         return clickTimed ? std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - clickStart).count() : 0.0;
     }
 
-    // v2.78.4: 1.25x (was 2x): with the searches now sharing the click's time, a whole save
-    // stays close to the budget
     bool clickOverTime() {
         return clickMs() > buf.budgetMs * 1.25;
     }
 
-    // v2.78.4: what's left of the click's time for a search. Each search used to get the full
-    // budget on its own, on top of the base run, memory try and orb checks before it, so a
-    // wave save on GRIEF could take 2-3 frames at 240 fps.
-    // v2.80.2: but always at least half the budget. Orb alignment (up to 1.75x since v2.79)
-    // could use all of it, and the normal search then stopped after one delay ("prediction
-    // budget hit at +1 ticks" on almost every click near an orb, Heliopolis).
+    // what's left of the click's time for a search
     double searchBudget() {
-        return clickTimed ? std::max(buf.budgetMs - clickMs(), buf.budgetMs * 0.5) : buf.budgetMs;
+        return clickTimed ? buf.budgetMs - clickMs() : buf.budgetMs;
     }
 
     struct ClickTimer {
@@ -2868,8 +2306,7 @@ namespace {
 
     // After every buffer decision: drift check + path view for the input the game gets.
     // v2.70: the extras after the search (robust check, drift check, path view) are skipped
-    // once the click has used up its time, so one click can't stall a frame for long. The
-    // search itself keeps its budget.
+    // once the click has used up its time, so one click can't stall a frame for long.
     void decided(PlayLayer* layer, PlayerObject* p1, PlayerObject* p2, bool dual, int delay, bool down, int horizon, int releaseAfter) {
         memoryNote(p1, delay);
         if (clickMs() > buf.budgetMs * 1.5) {
@@ -2884,36 +2321,6 @@ namespace {
     int fullWaveHorizon(bool mini) {
         int wh = std::clamp(buf.waveHorizon, 20, 160);
         return st(mini ? std::max(20, wh - 15) : wh);  // v4.6: 65 normal / 50 mini
-    }
-
-    // v2.83 two clicks ahead: a run can crash only because the ghost never clicks again (the
-    // next obstacle needs your next click). One more tap is tried 8 / 16 / 26 ticks before the
-    // crash, but never sooner than 24 ticks after this click (a real second click, not a
-    // double tap). If it then lives 40 ticks past the old crash (or the whole look-ahead), the
-    // crash wasn't this click's. Returns when that tap is (ticks after the click), or -1.
-    constexpr int NEXT_CLICK_MARGINS[] = { 8, 16, 26 };
-    constexpr int NEXT_CLICK_MIN = 24;
-
-    int nextClickAt(PlayLayer* layer, PlayerObject* p1, PlayerObject* p2, bool dual, int delay, bool down, int horizon, int releaseAfter,
-        int ret) {
-        if (!buf.nextClick || ret >= horizon || ret < st(NEXT_CLICK_MIN + 8)) {
-            return -1;
-        }
-        int length = std::min(horizon, ret + st(40));
-        for (int margin : NEXT_CLICK_MARGINS) {
-            int at = ret - st(margin);
-            if (at < st(NEXT_CLICK_MIN) || clickOverTime()) {
-                break;
-            }
-            buf.retapAt = at;
-            SimEnd e;
-            int r = simulate(layer, p1, p2, dual, delay, down, length, releaseAfter, length, &e);
-            buf.retapAt = -1;
-            if (r >= length) {
-                return at;
-            }
-        }
-        return -1;
     }
 
     // v2.6 orb alignment: a press made a little before reaching an orb would be wasted
@@ -3012,8 +2419,7 @@ namespace {
         int to = std::min(maxDelay, std::max(leave, touch + st(6)));
         int safeStart = -1, safeEnd = -1;
         int bestRet = -1, bestK = 0;
-        int bestAt = -1;  // v2.78.2: when the best timing crashes, counted from now (k + ret)
-        std::string nextNote;  // v2.83: what the next-click check found
+        int bestAt = -1;  // v2.79: when the best timing crashes, counted from now (k + ret)
         // v2.79: orb clicks get more time (1.75x the budget for the scan, 2x with the robustness
         // check): at 240 fps one frame (~4 ms) only covered about 6 ticks of ORBIT's 20-tick orbs
         double orbBudget = buf.budgetMs * 1.75;
@@ -3045,7 +2451,7 @@ namespace {
             else if (safeStart >= 0) {
                 break;  // the first safe stretch is over
             }
-            // v2.78.2: timings are compared by when they crash counted from now, not from each
+            // v2.79: timings are compared by when they crash counted from now, not from each
             // click: on ORBIT, clicking 9 ticks later lived 59 ticks after its click (crash at
             // t68) vs 50 for clicking now (t50), 18 ticks later, but 59 < 50 + 12 so it was
             // never picked
@@ -3071,38 +2477,36 @@ namespace {
             }
             *landed = horizon;
         }
-        // v2.80.1: nothing fully safe: the timing that crashes clearly latest. When clicking now
-        // would miss the orb, 12 ticks later is enough (using the orb beats missing it).
-        // v2.80.2: when clicking now already uses the orb, the crash must come at least 30 ticks
-        // later: that gets past the obstacle that kills you now, and the later crash is the next
-        // obstacle, which needs your next click (Heliopolis: now t21, +6t -> t77). Small gains
-        // (v2.80.1 "ORB timing +4t -> 62t", then died anyway) still aren't taken.
-        else {
-            // v2.83: clicking now uses the orb and only dies to what your next click handles:
-            // leave it. Otherwise the 30-tick rule, or a timing your next click makes safe.
-            int nowNext = nowUsed && now >= 0 ? nextClickAt(layer, p1, p2, dual, 0, true, horizon, releaseAfter, now) : -1;
-            if (nowNext >= 0) {
-                nextNote = fmt::format(" (now is fine if you click again by t{})", nowNext);
+        else if (bestK > 0 && bestAt >= std::max(now, 0) + st(12)) {
+            // nothing fully safe: the timing that crashes clearly latest
+            // v2.87.1 fix-orb-checks: this pick never went through the robust check. It must still crash
+            // clearly latest (same bar as above) and use the orb with you half a tick ahead / behind;
+            // otherwise no pick, and the normal search runs.
+            bool keep = true;
+            if (buf.fixOrbChecks && buf.robustSaves) {
+                float jitter = std::max(0.3f, 0.5f * (311.58f / 240.f) * (std::abs(p1->m_playerSpeed) / 0.9f));
+                for (float off : { jitter, -jitter }) {
+                    buf.ghostShiftX = off;
+                    bool used;
+                    int ret = tryAt(bestK, &used);
+                    buf.ghostShiftX = 0.f;
+                    if (!used || bestK + ret < std::max(now, 0) + st(12)) {
+                        keep = false;
+                        break;
+                    }
+                }
             }
-            else if (bestK > 0 && bestAt >= std::max(now, 0) + st(nowUsed ? 30 : 12)) {
+            if (keep) {
                 found = bestK;
                 *landed = bestRet;
-            }
-            else if (bestK > 0 && bestAt > std::max(now, 0)) {
-                int at = nextClickAt(layer, p1, p2, dual, bestK, true, horizon, releaseAfter, bestRet);
-                if (at >= 0) {
-                    found = bestK;
-                    *landed = bestRet;
-                    nextNote = fmt::format(" (safe if you click again by t{})", at);
-                }
             }
         }
         buf.orbWasTiming = found > 0 && nowUsed;
         // v2.42 explain: "+k:ret o" = press k ticks later lives ret ticks and used the orb
         if (buf.explain) {
-            say("orb: inside t{}-t{}, press now {} -> {}t |{} => {}{}{}", touch, leave, nowUsed ? "uses it" : "misses it", now,
+            say("orb: inside t{}-t{}, press now {} -> {}t |{} => {}{}", touch, leave, nowUsed ? "uses it" : "misses it", now,
                 trace.empty() ? " (nothing to try)" : trace, found > 0 ? fmt::format("+{}t", found) : std::string("no pick"),
-                safeStart >= 0 ? fmt::format(" (safe +{}..+{}t)", safeStart, safeEnd) : std::string(), nextNote);
+                safeStart >= 0 ? fmt::format(" (safe +{}..+{}t)", safeStart, safeEnd) : std::string());
         }
         return found;
     }
@@ -3110,14 +2514,6 @@ namespace {
     // v2.1: best delayed run seen by the last search (shown in the "no save" log line)
     int dbgBestK = 0;
     int dbgBestRet = -1;
-    // v2.85 no-hitch: the first delay a search tries (later than +1 when it goes on from a
-    // previous tick), and where the last search ran out of time (0 = it didn't)
-    int searchFrom = 1;
-    int budgetCutK = 0;
-    // set while a search is going on from a previous tick
-    bool resumeNow = false;
-    QueuedInput resumeEntry {};
-    constexpr int MAX_RESUMES = 4;
 
     // v2.7 wave scoring, the wave version of the cube's "landed safely". A wave never
     // lands, so a run that keeps going one way eventually hits a wall even in a normal
@@ -3163,9 +2559,7 @@ namespace {
     // so "pressing now crashes" only if NO release time saves it. Your usual hold is tried
     // first, then short to long holds. (Before, only your usual hold was tested, so a press
     // that needed a shorter or longer hold looked like a death and got delayed for nothing.)
-    // v2.82: 8 hold lengths up to a full-height jump (was 4, up to 45 ticks), tried nearest
-    // to your usual hold first, so the jump height a gap needs is found more often.
-    constexpr int ROBOT_HOLDS[] = { 4, 9, 14, 20, 27, 36, 48, 64 };
+    constexpr int ROBOT_HOLDS[] = { 6, 14, 26, 45 };
     int robotUsedHold = -1;   // hold length that made the last robot run survive
 
     // v2.73: quick pass of a robot / UFO / spider search: only the plain run per delay (your
@@ -3180,15 +2574,9 @@ namespace {
         if (best >= target || *end == SimEnd::StopSearch || quickScore) {
             return best;
         }
-        int holds[std::size(ROBOT_HOLDS)];
-        std::copy(std::begin(ROBOT_HOLDS), std::end(ROBOT_HOLDS), holds);
-        std::stable_sort(std::begin(holds), std::end(holds), [&](int a, int b) { return std::abs(st(a) - usual) < std::abs(st(b) - usual); });
-        for (int hold : holds) {
+        for (int hold : ROBOT_HOLDS) {
             if (std::abs(st(hold) - usual) < st(3)) {
                 continue;
-            }
-            if (clickOverTime()) {
-                break;
             }
             SimEnd e;
             int ret = simulateOrbs(layer, p1, p2, dual, delay, true, horizon, st(hold), target, &e);
@@ -3268,9 +2656,8 @@ namespace {
         int target = needFull ? horizon : std::min(horizon, base + st(12));
         dbgBestK = 0;
         dbgBestRet = -1;
-        budgetCutK = 0;
         int streak = 0;
-        for (int k = searchFrom; k <= maxDelay; ++k) {
+        for (int k = 1; k <= maxDelay; ++k) {
             SimEnd end;
             int ret = score(k, target, &end);
             if (ret > dbgBestRet) {
@@ -3291,7 +2678,6 @@ namespace {
                 if (!quiet) {
                     say("prediction budget hit at +{} ticks", k);
                 }
-                budgetCutK = k;
                 return 0;
             }
         }
@@ -3312,7 +2698,6 @@ namespace {
         double left = buf.budgetMs - clickMs();
         if (left < 0.5) {
             say("prediction budget hit (quick pass only)");
-            budgetCutK = 0;
             return 0;
         }
         return searchSmallest(horizon, maxDelay, base, landed, score, left, false, needFull);
@@ -3393,8 +2778,7 @@ namespace {
         int target = std::min(horizon, base + st(12));
         dbgBestK = 0;
         dbgBestRet = -1;
-        budgetCutK = 0;
-        for (int k = searchFrom; k <= maxDelay; ++k) {
+        for (int k = 1; k <= maxDelay; ++k) {
             SimEnd end;
             int ret = waveScore(layer, p1, p2, dual, k, down, horizon, target, &end);
             if (ret > dbgBestRet) {
@@ -3422,7 +2806,6 @@ namespace {
             }
             if (std::chrono::duration<double, std::milli>(clock::now() - start).count() > budget) {
                 say("prediction budget hit at +{} ticks", k);
-                budgetCutK = k;
                 return 0;
             }
         }
@@ -3445,8 +2828,7 @@ namespace {
         int sameStreak = 0;
         int waveBestK = 0;
         int waveBestRet = base;
-        budgetCutK = 0;
-        for (int k = searchFrom; k <= maxDelay; ++k) {
+        for (int k = 1; k <= maxDelay; ++k) {
             SimEnd end;
             // Wave needs the full run to compare gains; elsewhere reaching `target` is enough.
             int ret = simulateOrbs(layer, p1, p2, dual, k, down, horizon, releaseAfter, anyWave ? horizon : target, &end);
@@ -3502,7 +2884,6 @@ namespace {
             }
             if (overBudget()) {
                 say("prediction budget hit at +{} ticks", k);
-                budgetCutK = anyWave ? 0 : k;
                 break;
             }
         }
@@ -3511,225 +2892,6 @@ namespace {
             return waveBestK;
         }
         return 0;
-    }
-
-    // v2.65 live path (F10): between clicks the path keeps updating (v2.70: 20 times a second):
-    // blue = where you go if you do nothing, yellow = where a click right now takes you.
-    // After a click, that click's path (red / green) stays up briefly first.
-    void livePath(PlayLayer* layer, PlayerObject* p1) {
-        if (!buf.showPath || buf.perfMode || !buf.pathNode || !buf.ghost1 || buf.simulating || p1->m_isDead || layer->m_isPlatformer) {
-            return;
-        }
-        if (tickCount < buf.pathHoldUntil || !buf.queue.empty() || tickCount % st(12) != 0) {
-            return;
-        }
-        bool twoPlayer = layer->m_level && layer->m_level->m_twoPlayerMode;
-        bool dual = !twoPlayer && layer->m_gameState.m_isDualMode && layer->m_player2;
-        auto* p2 = dual ? layer->m_player2 : nullptr;
-        bool wave = p1->m_isDart || (p2 && p2->m_isDart);
-        bool ship = p1->m_isShip || (p2 && p2->m_isShip);
-        bool flyer = isFlying(p1) || (p2 && isFlying(p2));
-        bool mini = (p1->m_isDart && p1->m_vehicleSize < 1.f) || (p2 && p2->m_isDart && p2->m_vehicleSize < 1.f);
-        int horizon = wave ? fullWaveHorizon(mini) : st(flyer ? 48 : std::clamp(buf.groundHorizon, 48, 240));
-        bool down = !buf.appliedInput;
-        int releaseAfter = down && !wave && !ship ? holdEstimate() : -1;
-
-        buf.pathNode->clear();
-        bool idleDied = false;
-        buf.skipPress = true;
-        auto idle = recordRun(layer, p1, p2, dual, 0, down, horizon, -1, &idleDied);
-        buf.skipPress = false;
-        drawPath(idle, 0, { 0.45f, 0.7f, 1.f, 0.6f }, idleDied);
-        bool clickDied = false;
-        auto click = recordRun(layer, p1, p2, dual, 0, down, horizon, releaseAfter, &clickDied);
-        drawPath(click, 0, { 1.f, 0.85f, 0.3f, 0.85f }, clickDied);
-    }
-
-    void queueInput(int ticks, bool down) {
-        buf.queue.push_back({ ticks, down });
-    }
-
-    // v2.51 practice stats: every save (or, in training, every input that would have been
-    // saved) is how early you were, in 240/s ticks.
-    struct Stats {
-        int saves = 0;
-        int earlySum = 0;
-        int attempts = 0;            // attempts that had at least one save
-        std::map<int, int> savesAt;  // level percent -> saves there
-    };
-    Stats attemptStats;
-    Stats sessionStats;
-    std::string statsKey;
-
-    void noteSave(PlayLayer* layer, int ticks) {
-        int t = static_cast<int>(std::lround(ticks / stepScale()));
-        int pct = std::clamp(static_cast<int>(layer->getCurrentPercent()), 0, 100);
-        for (auto* s : { &attemptStats, &sessionStats }) {
-            ++s->saves;
-            s->earlySum += t;
-            ++s->savesAt[pct];
-        }
-        // v2.56: a ding for every real save (training mode shows its hint instead)
-        if (buf.saveDing && !buf.train) {
-            FMODAudioEngine::sharedEngine()->playEffect("counter003.ogg");
-        }
-    }
-
-    std::string attemptSummary() {
-        auto const& a = attemptStats;
-        return fmt::format("{} {} | avg {:.1f}t ({:.2f}f) early", a.saves, buf.train ? (a.saves == 1 ? "early click" : "early clicks")
-            : (a.saves == 1 ? "save" : "saves"), static_cast<double>(a.earlySum) / a.saves, a.earlySum * TICK / a.saves);
-    }
-
-    // At the end of an attempt (death, restart or level complete).
-    // v2.52: logged to the console only (no popup after a death)
-    void endAttempt() {
-        if (attemptStats.saves > 0) {
-            ++sessionStats.attempts;
-            say("attempt: {}", attemptSummary());
-        }
-        attemptStats = {};
-    }
-
-    // v2.51 training mode: the input goes through untouched, and you're told how early it was.
-    bool trainInstead(PlayLayer* layer, int ticks, bool down, char const* what) {
-        if (!buf.train) {
-            return false;
-        }
-        noteSave(layer, ticks);
-        say("TRAIN {} {}: {}t ({:g}f) early", what, down ? "press" : "release", ticks, ticks * TICK);
-        if (buf.hintLabel) {
-            buf.hintLabel->setString(fmt::format("{} {:g}f early", down ? "click" : "release", ticks * TICK).c_str());
-            buf.hintLabel->stopAllActions();
-            buf.hintLabel->setOpacity(230);
-            buf.hintLabel->setScale(0.5f);
-            buf.hintLabel->runAction(CCSequence::create(CCEaseBackOut::create(CCScaleTo::create(0.12f, 0.6f)), CCDelayTime::create(0.5f),
-                CCFadeOut::create(0.4f), nullptr));
-        }
-        return true;
-    }
-
-    // v2.51 per-level settings: your stage and switches are remembered for each level and
-    // come back when you open it again. Outside a level (and in levels you haven't changed
-    // anything in) the normal settings apply.
-    // v2.58: the stage and low latency are no longer per level; they're the same everywhere.
-    constexpr char const* PROFILE_KEYS[] = { "robust-saves", "orb-align", "orb-timing", "level-memory",
-        "more-time-death-spots", "ship-buffer", "ufo-smart", "ball-smart", "swing-smart", "cbf-sync", "predict-moving-objects",
-        "training-mode" };
-
-    struct Globals {
-        bool have = false;
-        std::vector<bool> values;
-    } globals;
-
-    std::string profileKey() {
-        return memoryKey.empty() ? std::string() : "profile-" + memoryKey;
-    }
-
-    void saveProfile() {
-        if (!buf.perLevel || profileKey().empty() || !globals.have) {
-            return;
-        }
-        auto v = matjson::Value::object();
-        for (auto* key : PROFILE_KEYS) {
-            v[key] = Mod::get()->getSettingValue<bool>(key);
-        }
-        Mod::get()->setSavedValue(profileKey(), v);
-    }
-
-    void restoreGlobals() {
-        if (!globals.have) {
-            return;
-        }
-        auto* mod = Mod::get();
-        for (size_t i = 0; i < std::size(PROFILE_KEYS); ++i) {
-            mod->setSettingValue<bool>(PROFILE_KEYS[i], globals.values[i]);
-        }
-        globals = {};
-        mod->setSavedValue("profile-globals", matjson::Value(nullptr));
-        readSettings();
-        applyStage();
-    }
-
-    void loadProfile() {
-        if (!buf.perLevel || profileKey().empty()) {
-            return;
-        }
-        auto* mod = Mod::get();
-        globals.have = true;
-        globals.values.clear();
-        auto backup = matjson::Value::object();
-        for (auto* key : PROFILE_KEYS) {
-            bool value = mod->getSettingValue<bool>(key);
-            globals.values.push_back(value);
-            backup[key] = value;
-        }
-        // kept until the level is left, so a crash mid-level can't leave level settings behind
-        mod->setSavedValue("profile-globals", backup);
-        if (!mod->hasSavedValue(profileKey())) {
-            return;
-        }
-        auto v = mod->getSavedValue<matjson::Value>(profileKey());
-        if (!v.isObject()) {
-            return;
-        }
-        for (auto* key : PROFILE_KEYS) {
-            if (v.contains(key)) {
-                mod->setSettingValue<bool>(key, v[key].asBool().unwrapOr(mod->getSettingValue<bool>(key)));
-            }
-        }
-        readSettings();
-        applyStage();
-        say("level settings loaded: {}", stageText());
-    }
-
-    // Settings a crash left behind are put back when the game starts.
-    void recoverGlobals() {
-        auto* mod = Mod::get();
-        if (!mod->hasSavedValue("profile-globals")) {
-            return;
-        }
-        auto v = mod->getSavedValue<matjson::Value>("profile-globals");
-        if (!v.isObject()) {
-            return;
-        }
-        for (auto* key : PROFILE_KEYS) {
-            if (v.contains(key)) {
-                mod->setSettingValue<bool>(key, v[key].asBool().unwrapOr(mod->getSettingValue<bool>(key)));
-            }
-        }
-        mod->setSavedValue("profile-globals", matjson::Value(nullptr));
-    }
-
-    // v2.51 death heatmap: red marks on the progress bar where level memory saw you die,
-    // brighter where you die more.
-    void refreshHeatmap() {
-        auto* layer = GameManager::get()->m_playLayer;
-        if (!buf.heatNode || !layer || !layer->m_progressBar) {
-            return;
-        }
-        buf.heatNode->clear();
-        float length = layer->m_levelLength;
-        if (!buf.heatmap || length <= 0.f) {
-            return;
-        }
-        auto size = layer->m_progressBar->getContentSize();
-        uint32_t most = 0;
-        for (auto const& [slice, spot] : memory) {
-            most = std::max(most, spot.deaths);
-        }
-        if (most == 0) {
-            return;
-        }
-        for (auto const& [slice, spot] : memory) {
-            if (spot.deaths == 0) {
-                continue;
-            }
-            float pct = std::clamp((slice + 0.5f) * SLICE / length, 0.f, 1.f);
-            float x = 2.f + pct * (size.width - 4.f);
-            float heat = static_cast<float>(spot.deaths) / most;
-            buf.heatNode->drawSegment({ x, 2.f }, { x, size.height - 2.f }, 0.7f, { 1.f, 0.35f + 0.3f * (1.f - heat), 0.55f, 0.35f + 0.6f * heat });
-        }
     }
 
     // v2.75 run check (test bench). Every attempt played from the level start is recorded
@@ -3837,10 +2999,9 @@ namespace {
         if (!benchBestDirty || memoryKey.empty()) {
             return;
         }
-        benchBestDirty = false;
         std::error_code ec;
         std::filesystem::create_directories(benchFile().parent_path(), ec);
-        std::ofstream out(benchFile(), std::ios::trunc);
+        std::ostringstream out;  // v2.87.1: written to a temp file and renamed, so a failed write keeps the old recording
         out << benchBest.startX << ' ' << benchBest.startY << ' ' << benchBest.dt << ' ' << benchBest.track.size() << ' '
             << benchBest.inputs.size() << '\n';
         for (auto const& [t, d] : benchBest.inputs) {
@@ -3848,6 +3009,14 @@ namespace {
         }
         for (auto const& p : benchBest.track) {
             out << p.x << ' ' << p.y << '\n';
+        }
+        std::string err;
+        if (cfg::writeFileAtomic(benchFile(), out.str(), &err)) {
+            benchBestDirty = false;  // only clean once it really is on disk
+            ioOk("run-check recording");
+        }
+        else {
+            ioFailed("run-check recording", err);
         }
     }
 
@@ -3867,8 +3036,8 @@ namespace {
         buf.ghostDied = false;
         buf.ghostHitPortal = false;
         buf.haveRealRect = false;
-        buf.haveStartRects = false;  // run check starts at the level start, not where you are
         buf.harmless.clear();
+        buf.harmless2.clear();
         buf.orbClick = false;  // orbs only through the recorded inputs
         buf.retapAt = -1;
         copyState(buf.ghost1, p1);
@@ -3913,14 +3082,251 @@ namespace {
         buf.orbClick = buf.assumeOrbs;
         double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - clockStart).count();
         int matched = firstOff < 0 ? t : firstOff;
-        lastBench = fmt::format("{}/{} steps ({:.0f}%) match, stopped at {}", matched, r.track.size(),
-            100.0 * matched / r.track.size(), end);
+        lastBench = fmt::format("{}/{} steps ({:.0f}%) match, stopped at {} (P1 only; triggers and moving objects are not replayed)", matched,
+            r.track.size(), 100.0 * matched / r.track.size(), end);
         say("run check: {} | max error {:.1f}u{} | {:.0f} ms", lastBench, maxErr,
             std::abs(r.dt - buf.tickLength) > 1e-4f ? " | recorded at another frame rate" : "", ms);
         std::error_code ec;
         std::filesystem::create_directories(Mod::get()->getSaveDir(), ec);
         std::ofstream(Mod::get()->getSaveDir() / "run-check-results.txt", std::ios::app)
             << Mod::get()->getVersion().toVString() << ' ' << memoryKey << ": " << lastBench << '\n';
+    }
+
+    // v2.65 live path (F10): between clicks the path keeps updating (v2.70: 20 times a second):
+    // blue = where you go if you do nothing, yellow = where a click right now takes you.
+    // After a click, that click's path (red / green) stays up briefly first.
+    void livePath(PlayLayer* layer, PlayerObject* p1) {
+        if (!buf.showPath || buf.perfMode || !buf.pathNode || !buf.ghost1 || buf.simulating || p1->m_isDead || layer->m_isPlatformer) {
+            return;
+        }
+        if (tickCount < buf.pathHoldUntil || !buf.queue.empty() || tickCount % st(12) != 0) {
+            return;
+        }
+        bool twoPlayer = layer->m_level && layer->m_level->m_twoPlayerMode;
+        bool dual = !twoPlayer && layer->m_gameState.m_isDualMode && layer->m_player2;
+        auto* p2 = dual ? layer->m_player2 : nullptr;
+        bool wave = p1->m_isDart || (p2 && p2->m_isDart);
+        bool ship = p1->m_isShip || (p2 && p2->m_isShip);
+        bool flyer = isFlying(p1) || (p2 && isFlying(p2));
+        bool mini = (p1->m_isDart && p1->m_vehicleSize < 1.f) || (p2 && p2->m_isDart && p2->m_vehicleSize < 1.f);
+        int horizon = wave ? fullWaveHorizon(mini) : st(flyer ? 48 : std::clamp(buf.groundHorizon, 48, 240));
+        bool down = !buf.appliedInput;
+        int releaseAfter = down && !wave && !ship ? holdEstimate() : -1;
+
+        buf.pathNode->clear();
+        bool idleDied = false;
+        buf.skipPress = true;
+        auto idle = recordRun(layer, p1, p2, dual, 0, down, horizon, -1, &idleDied);
+        buf.skipPress = false;
+        drawPath(idle, 0, { 0.45f, 0.7f, 1.f, 0.6f }, idleDied);
+        bool clickDied = false;
+        auto click = recordRun(layer, p1, p2, dual, 0, down, horizon, releaseAfter, &clickDied);
+        drawPath(click, 0, { 1.f, 0.85f, 0.3f, 0.85f }, clickDied);
+    }
+
+    void queueInput(int ticks, bool down) {
+        buf.queue.push_back({ ticks, down });
+    }
+
+    // v2.51 practice stats: every save (or, in training, every input that would have been
+    // saved) is how early you were, in 240/s ticks.
+    struct Stats {
+        int saves = 0;
+        int earlySum = 0;
+        int attempts = 0;            // attempts that had at least one save
+        std::map<int, int> savesAt;  // level percent -> saves there
+    };
+    Stats attemptStats;
+    Stats sessionStats;
+    std::string statsKey;
+
+    void noteSave(PlayLayer* layer, int ticks) {
+        int t = static_cast<int>(std::lround(ticks / stepScale()));
+        int pct = std::clamp(static_cast<int>(layer->getCurrentPercent()), 0, 100);
+        for (auto* s : { &attemptStats, &sessionStats }) {
+            ++s->saves;
+            s->earlySum += t;
+            ++s->savesAt[pct];
+        }
+        // v2.56: a ding for every real save (training mode shows its hint instead)
+        if (buf.saveDing && !buf.train) {
+            FMODAudioEngine::sharedEngine()->playEffect("counter003.ogg");
+        }
+    }
+
+    std::string attemptSummary() {
+        auto const& a = attemptStats;
+        return fmt::format("{} {} | avg {:.1f}t ({:.2f}f) early", a.saves, buf.train ? (a.saves == 1 ? "early click" : "early clicks")
+            : (a.saves == 1 ? "save" : "saves"), static_cast<double>(a.earlySum) / a.saves, a.earlySum * TICK / a.saves);
+    }
+
+    // At the end of an attempt (death, restart or level complete).
+    // v2.52: logged to the console only (no popup after a death)
+    void endAttempt() {
+        if (attemptStats.saves > 0) {
+            ++sessionStats.attempts;
+            say("attempt: {}", attemptSummary());
+        }
+        attemptStats = {};
+    }
+
+    // v2.51 training mode: the input goes through untouched, and you're told how early it was.
+    bool trainInstead(PlayLayer* layer, int ticks, bool down, char const* what) {
+        if (!buf.train) {
+            return false;
+        }
+        noteSave(layer, ticks);
+        say("TRAIN {} {}: {}t ({:g}f) early", what, down ? "press" : "release", ticks, ticks * TICK);
+        if (buf.hintLabel && buf.showHint) {
+            buf.hintLabel->setString(fmt::format("{} {:g}f early", down ? "click" : "release", ticks * TICK).c_str());
+            buf.hintLabel->stopAllActions();
+            buf.hintLabel->setOpacity(230);
+            buf.hintLabel->setScale(0.5f);
+            buf.hintLabel->runAction(CCSequence::create(CCEaseBackOut::create(CCScaleTo::create(0.12f, 0.6f)), CCDelayTime::create(0.5f),
+                CCFadeOut::create(0.4f), nullptr));
+        }
+        return true;
+    }
+
+    // v2.51 per-level settings: your switches (v2.59: not the stage, not low latency) are remembered for each level and
+    // come back when you open it again. Outside a level (and in levels you haven't changed
+    // anything in) the normal settings apply.
+    constexpr char const* PROFILE_KEYS[] = { "robust-saves", "orb-align", "orb-timing", "level-memory",
+        "more-time-death-spots", "ship-buffer", "ufo-smart", "ball-smart", "swing-smart", "cbf-sync", "predict-moving-objects",
+        "training-mode" };
+
+    struct Globals {
+        bool have = false;
+        std::vector<bool> values;
+    } globals;
+
+    std::string profileKey() {
+        return memoryKey.empty() ? std::string() : "profile-" + memoryKey;
+    }
+
+    void saveProfile() {
+        if (!buf.perLevel || profileKey().empty() || !globals.have) {
+            return;
+        }
+        auto v = matjson::Value::object();
+        for (auto* key : PROFILE_KEYS) {
+            v[key] = cfg::b(key);
+        }
+        Mod::get()->setSavedValue(profileKey(), v);
+    }
+
+    void restoreGlobals() {
+        if (!globals.have) {
+            return;
+        }
+        auto* mod = Mod::get();
+        for (size_t i = 0; i < std::size(PROFILE_KEYS); ++i) {
+            cfg::setTemp(PROFILE_KEYS[i], globals.values[i]);
+        }
+        globals = {};
+        mod->setSavedValue("profile-globals", matjson::Value(nullptr));
+        readSettings();
+        applyStage();
+    }
+
+    void loadProfile() {
+        if (!buf.perLevel || profileKey().empty()) {
+            return;
+        }
+        auto* mod = Mod::get();
+        globals.have = true;
+        globals.values.clear();
+        auto backup = matjson::Value::object();
+        for (auto* key : PROFILE_KEYS) {
+            bool value = cfg::b(key);
+            globals.values.push_back(value);
+            backup[key] = value;
+        }
+        // kept until the level is left, so a crash mid-level can't leave level settings behind
+        mod->setSavedValue("profile-globals", backup);
+        if (!mod->hasSavedValue(profileKey())) {
+            return;
+        }
+        auto v = mod->getSavedValue<matjson::Value>(profileKey());
+        if (!v.isObject()) {
+            return;
+        }
+        for (auto* key : PROFILE_KEYS) {
+            if (v.contains(key)) {
+                cfg::setTemp(key, v[key].asBool().unwrapOr(cfg::b(key)));
+            }
+        }
+        readSettings();
+        applyStage();
+        say("level settings loaded: {}", stageText());
+    }
+
+    // Settings a crash left behind are put back when the game starts.
+    void recoverGlobals() {
+        auto* mod = Mod::get();
+        if (!mod->hasSavedValue("profile-globals")) {
+            return;
+        }
+        auto v = mod->getSavedValue<matjson::Value>("profile-globals");
+        if (!v.isObject()) {
+            return;
+        }
+        for (auto* key : PROFILE_KEYS) {
+            if (v.contains(key)) {
+                cfg::setTemp(key, v[key].asBool().unwrapOr(cfg::b(key)));
+            }
+        }
+        mod->setSavedValue("profile-globals", matjson::Value(nullptr));
+    }
+
+    // v2.51 death heatmap: red marks on the progress bar where level memory saw you die,
+    // brighter where you die more.
+    void refreshHeatmap() {
+        auto* layer = GameManager::get()->m_playLayer;
+        if (!buf.heatNode || !layer || !layer->m_progressBar) {
+            return;
+        }
+        buf.heatNode->clear();
+        float length = layer->m_levelLength;
+        if (!buf.heatmap || length <= 0.f) {
+            return;
+        }
+        auto size = layer->m_progressBar->getContentSize();
+        uint32_t most = 0;
+        for (auto const& [slice, spot] : memory) {
+            most = std::max(most, spot.deaths);
+        }
+        if (most == 0) {
+            return;
+        }
+        for (auto const& [slice, spot] : memory) {
+            if (spot.deaths == 0) {
+                continue;
+            }
+            float pct = std::clamp((slice + 0.5f) * SLICE / length, 0.f, 1.f);
+            float x = 2.f + pct * (size.width - 4.f);
+            float heat = static_cast<float>(spot.deaths) / most;
+            buf.heatNode->drawSegment({ x, 2.f }, { x, size.height - 2.f }, 0.7f, { 1.f, 0.35f + 0.3f * (1.f - heat), 0.55f, 0.35f + 0.6f * heat });
+        }
+    }
+
+    // Console toggles: the AUTO INPUTS ON tag and the TPS text (both off by default).
+    void refreshOverlays() {
+        bool autoOn = buf.autoRelease || buf.robotAutoRelease || buf.dashAutoRelease || buf.autoClick;
+        if (buf.autoTagLabel) {
+            // v2.87.1: shown by itself (display only) whenever an automatic input can act outside practice mode
+            bool actsOutsidePractice = autoOn && buf.autoNormalRuns && buf.enabled;
+            buf.autoTagLabel->setVisible((buf.showAutoTag && autoOn) || actsOutsidePractice);
+        }
+        if (buf.tpsLabel) {
+            buf.tpsLabel->setString(fmt::format("TPS {}", buf.tps).c_str());
+            buf.tpsLabel->setVisible(buf.showTpsText);
+        }
+        if (buf.watermarkLabel) {
+            std::string tps = buf.tps != 240 ? fmt::format("  |  {} TPS", buf.tps) : std::string();
+            buf.watermarkLabel->setString(fmt::format("Testing  |  {}{}", stageText(), tps).c_str());
+            buf.watermarkLabel->setVisible(buf.showWatermark && buf.enabled);
+        }
     }
 
     // v2.51 stats popup text
@@ -3972,31 +3378,6 @@ namespace {
         if (!layer) {
             return false;
         }
-        // v2.85 no-hitch: a search going on from an earlier tick starts after the delays it
-        // already tried. A new input of yours meanwhile ends it: the waiting click becomes a
-        // plain delayed click, and this input follows it as usual.
-        bool resuming = resumeNow;
-        searchFrom = resuming ? std::max(1, resumeEntry.from) : 1;
-        budgetCutK = 0;
-        struct SearchFromReset {
-            ~SearchFromReset() {
-                searchFrom = 1;
-            }
-        } searchFromReset;
-        if (!resuming) {
-            for (auto& q : buf.queue) {
-                q.resume = false;
-            }
-        }
-        // v2.80: the mod already clicked for you here; your own late click (press and its
-        // release) is swallowed so it doesn't jump a second time
-        if (buf.autoClicked && isPlayer1 && !resuming) {
-            if (!down) {
-                buf.autoClicked = false;
-            }
-            say("AUTO click: your own {} ignored (already clicked for you)", down ? "press" : "release");
-            return true;
-        }
 
         auto* level = layer->m_level;
         bool twoPlayer = level && level->m_twoPlayerMode;
@@ -4008,11 +3389,20 @@ namespace {
         // In two-player levels P2 is someone else: never simulate P1's input on it.
         bool dual = !twoPlayer && layer->m_gameState.m_isDualMode && layer->m_player2;
 
-        if (!resuming) {
-            buf.isPlayer1 = isPlayer1;
-            buf.realInput = down;
+        buf.isPlayer1 = isPlayer1;
+        // v2.79 auto-click: the game already clicked for you, so the click you were about
+        // to make (press and its release) is ignored
+        if (buf.swallowRelease && !down) {
+            buf.swallowRelease = false;
+            return true;
         }
-        if (buf.autoReleased && !resuming) {
+        if (buf.autoClicked && down && isPlayer1) {
+            buf.autoClicked = false;
+            buf.swallowRelease = true;
+            return true;
+        }
+        buf.realInput = down;
+        if (buf.autoReleased) {
             // the game already let go for you: your real release has nothing left to do
             buf.autoReleased = false;
             buf.autoDash = false;
@@ -4043,7 +3433,7 @@ namespace {
         // delayed inputs are queued one tick sooner, because the game's next tick boundary
         // is already the ghost's tick 1.
         float midTick = 0.f;
-        if (buf.cbfSync && buf.inRealUpdate && p1 && std::abs(buf.tickDx) > 0.01f && !resuming) {
+        if (buf.cbfSync && buf.inRealUpdate && p1 && std::abs(buf.tickDx) > 0.01f) {
             midTick = std::clamp((p1->getPosition().x - buf.tickStartX) / buf.tickDx, 0.f, 0.999f);
         }
         buf.firstStep = 1.f - midTick;
@@ -4077,15 +3467,13 @@ namespace {
         // v2.44: ship is steered by feathering, so it gets its own, much shorter spam gap;
         // otherwise nearly every ship input counted as spam and was never buffered.
         int spamGap = st(anyShip && !anyWave ? std::clamp(buf.shipSpamGap, 2, 40) : std::clamp(buf.spamGap, 4, 40));
-        if (!resuming) {
-            if (buf.sinceInput < spamGap) {
-                ++buf.rapid;
-            }
-            else {
-                buf.rapid = 0;
-            }
-            buf.sinceInput = 0;
+        if (buf.sinceInput < spamGap) {
+            ++buf.rapid;
         }
+        else {
+            buf.rapid = 0;
+        }
+        buf.sinceInput = 0;
         bool anyUfo = p1->m_isBird || (p2 && p2->m_isBird);
         bool anyBall = p1->m_isBall || (p2 && p2->m_isBall);
         bool anySwing = p1->m_isSwing || (p2 && p2->m_isSwing);
@@ -4100,16 +3488,17 @@ namespace {
                 buf.pathNode->clear();
                 buf.pathNode->drawDot(p1->getPosition(), 4.f, { 0.6f, 0.6f, 0.65f, 0.9f });
             }
-            // v2.63.2: waiting inputs are played one per tick, in order, starting next tick, with
-            // this one right after them. v2.61 dropped them (like v2.48), so a turn you made
-            // just never happened; v2.49 sent them all at once, which turned a waiting press +
-            // this release into a zero-length tap.
+            // v2.66: inputs still waiting aren't dropped any more (a dropped press was a turn
+            // that never happened) and aren't all sent at once (v2.49, a zero-length tap):
+            // they fire one per tick, in order, starting next tick, and this input right after.
             if (!buf.queue.empty()) {
-                int tick = 0;
-                for (auto& q : buf.queue) {
-                    q.ticksLeft = tick++;
+                for (size_t i = 0; i < buf.queue.size(); ++i) {
+                    buf.queue[i].ticksLeft = static_cast<int>(i);
                 }
-                queueInput(tick, down);
+                if (buf.queue.back().down != down) {
+                    queueInput(static_cast<int>(buf.queue.size()), down);
+                }
+                buf.shift = 0;
                 return true;
             }
             buf.appliedInput = down;
@@ -4133,7 +3522,13 @@ namespace {
         if (!buf.queue.empty()) {
             int after = buf.queue.back().ticksLeft;
             // low latency: a new press isn't shifted, it goes right after what's already queued
-            queueInput(buf.lowLatency && down ? after : std::max(buf.shift - early, after), down);
+            int target = buf.lowLatency && down ? after : std::max(buf.shift - early, after);
+            // v2.87.1 fix-lowlat-queue: "right after" a queued release was the SAME tick, so both went out in
+            // one update (a zero-length release). Now the press follows one tick later.
+            if (buf.fixLowLatQueue && buf.lowLatency && down && !buf.queue.back().down) {
+                target = after + 1;
+            }
+            queueInput(target, down);
             return true;
         }
 
@@ -4172,15 +3567,6 @@ namespace {
         if (buf.lowLatency) {
             maxDelay = std::min(maxDelay, st(4));  // at most 1 frame (60 fps) of delay
         }
-        if (buf.perMode) {
-            maxDelay = st(buf.modeTicks[modeIndex(p1, p2)]);  // v2.88: your frames for this mode (over low latency's cap)
-        }
-        if (resuming) {
-            maxDelay -= resumeEntry.elapsed;  // the time since your click counts
-            if (maxDelay < searchFrom) {
-                maxDelay = 0;
-            }
-        }
         if (maxDelay <= 0) {
             if (buf.explain) {
                 say("pass {}: max delay is 0 for this mode", down ? "press" : "release");
@@ -4200,7 +3586,7 @@ namespace {
 
         // On the ground a press is a jump; only move it onto an orb if the setting says so.
         bool grounded = p1->m_isOnGround && (!p2 || p2->m_isOnGround);
-        if (buf.explain && down && grounded && !buf.orbAlignGround && !anyWave && !anyShip && buf.orbAlign && buf.smart && !resuming) {
+        if (buf.explain && down && grounded && !buf.orbAlignGround && !anyWave && !anyShip && buf.orbAlign && buf.smart) {
             // v2.42: is there an orb right ahead that this ground jump could have been moved onto?
             SimEnd probeEnd;
             buf.skipPress = true;
@@ -4214,7 +3600,7 @@ namespace {
                     buf.firstOrbTick);
             }
         }
-        if (down && !anyWave && !anyShip && buf.orbAlign && buf.smart && (!grounded || buf.orbAlignGround) && !resuming) {
+        if (down && !anyWave && !anyShip && buf.orbAlign && buf.smart && (!grounded || buf.orbAlignGround)) {
             int orbLanded = 0;
             int k = memorySaysSkip(sliceOf(p1)) ? 0 : alignOrb(layer, p1, p2, dual, horizon, releaseAfter, memoryDelay(sliceOf(p1)), maxDelay, &orbLanded);
             if (k > 0 && trainInstead(layer, k, down, "orb")) {
@@ -4222,10 +3608,27 @@ namespace {
                 buf.appliedInput = down;
                 return false;
             }
+            // v2.87.1 fix-orb-checks: this branch returned before the moving-object check the normal path
+            // has. One extra run of the chosen timing with the watch on (same orb settings as alignOrb).
+            if (k > 0 && buf.fixOrbChecks && buf.avoidMovers) {
+                buf.sawMover = false;
+                buf.trackMovers = true;
+                buf.orbClick = false;
+                buf.orbAfterFirst = true;
+                SimEnd moverEnd;
+                simulate(layer, p1, p2, dual, k, true, horizon, releaseAfter, horizon, &moverEnd);
+                buf.trackMovers = false;
+                buf.orbClick = buf.assumeOrbs;
+                buf.orbAfterFirst = false;
+                if (buf.sawMover) {
+                    say("skip ORB +{}t: moving objects ahead", k);
+                    decided(layer, p1, p2, dual, 0, down, horizon, releaseAfter);
+                    buf.appliedInput = down;
+                    return false;
+                }
+            }
             if (k > 0) {
-                // v2.80.1: says so when it isn't a full save (the orb is used, but a crash still follows)
-                say("ORB {} +{}t ({:g}f) -> {}t{}", buf.orbWasTiming ? "timing" : "press", k, k * TICK, orbLanded,
-                    orbLanded < horizon ? fmt::format(" (not a full save: still crashes in {}t)", orbLanded) : std::string());
+                say("ORB {} +{}t ({:g}f) -> {}t", buf.orbWasTiming ? "timing" : "press", k, k * TICK, orbLanded);
                 noteSave(layer, k);
                 decided(layer, p1, p2, dual, k, down, horizon, releaseAfter);
                 buf.shift = k;
@@ -4239,9 +3642,6 @@ namespace {
         SimEnd end;
         bool cubeStyleWave = anyWave && !buf.waveV46;
         bool robotPress = down && anyRobot && !anyWave && buf.robotSmart;
-        // v2.82 robot release: letting go sets the jump's height, so it's judged like the press
-        // (the jump has to land safely) instead of "lives a bit longer than letting go now"
-        bool robotRelease = !down && anyRobot && !anyWave && !anyShip && buf.robotSmart;
         bool anySpider = p1->m_isSpider || (p2 && p2->m_isSpider);
         bool spiderPress = down && anySpider && !anyWave && !robotPress && buf.spiderSmart;
         bool ufoPress = down && anyUfo && !anyWave && !anyShip && buf.ufoSmart;  // v2.40
@@ -4260,20 +3660,8 @@ namespace {
                  : ufoPress      ? ufoScore(layer, p1, p2, dual, 0, horizon, releaseAfter, horizon, &end)
                  : shipInput     ? shipScore(layer, p1, p2, dual, 0, down, horizon, horizon, &end)
                                  : simulateOrbs(layer, p1, p2, dual, 0, down, horizon, releaseAfter, horizon, &end);
-        int baseHold = robotUsedHold;  // v2.82: the hold that made pressing now safe
-        bool baseSwitched = buf.lastRunSwitched;
         buf.captureKiller = false;
         buf.trackMovers = false;
-        // v2.83: through a mode portal the ghost never clicks again, so the new mode's first
-        // obstacle killed it. If one more click saves it, this input is fine as it is.
-        if (baseSwitched && base < horizon && !cubeStyleWave && !shipInput && end != SimEnd::StopSearch && buf.baseEscape < 0) {
-            int at = nextClickAt(layer, p1, p2, dual, 0, down, horizon, releaseAfter, base);
-            if (at >= 0) {
-                buf.baseEscape = at;
-                buf.baseCrash = base;
-                base = horizon;
-            }
-        }
 
         // v2.30 diagnostics: a ghost that dies within a few ticks while you live means the
         // prediction doesn't match you there. Log what killed it and how both hitboxes compare.
@@ -4289,10 +3677,9 @@ namespace {
             else {
                 say("ghost killed at t{} by no object (crushed / out of bounds / slope)", buf.killerTick);
             }
-            say("  hitbox ghost {:.1f}x{:.1f} vs you {:.1f}x{:.1f}, ghost moved dx {:.1f} dy {:.1f}{}{}", g.size.width, g.size.height,
+            say("  hitbox ghost {:.1f}x{:.1f} vs you {:.1f}x{:.1f}, ghost moved dx {:.1f} dy {:.1f}{}", g.size.width, g.size.height,
                 real.size.width, real.size.height, g.getMidX() - real.getMidX(), g.getMidY() - real.getMidY(),
-                buf.predictMovers ? " (moving objects predicted)" : "",
-                buf.triggersAhead > 0 ? fmt::format(" ({} move triggers ahead predicted)", buf.triggersAhead) : std::string());
+                buf.predictMovers ? " (moving objects predicted)" : "");
             // v2.54: which players exist and which one your clicks move
             auto desc = [](PlayerObject* p) {
                 if (!p) {
@@ -4343,6 +3730,36 @@ namespace {
                         bestCrash = crashAt;
                     }
                 }
+                // v2.87.1 fix-more-time-checks: this branch returned before the checks the normal path has.
+                // Moving objects: always. Robust: only when the delay removes the crash completely (a delay
+                // that only pushes the crash later can't be "robust": it still crashes).
+                if (bestK > 0 && buf.fixMoreTimeChecks) {
+                    if (buf.avoidMovers) {
+                        buf.sawMover = false;
+                        buf.trackMovers = true;
+                        SimEnd moverEnd;
+                        simulateOrbs(layer, p1, p2, dual, bestK, down, horizon, hold, horizon, &moverEnd);
+                        buf.trackMovers = false;
+                        if (buf.sawMover) {
+                            say("skip MORE TIME +{}t: moving objects ahead", bestK);
+                            bestK = 0;
+                        }
+                    }
+                    if (bestK > 0 && bestCrash < 0 && buf.robustSaves && !clickOverTime()) {
+                        float jitter = std::max(0.3f, 0.5f * (311.58f / 240.f) * (std::abs(p1->m_playerSpeed) / 0.9f));
+                        for (float off : { jitter, -jitter }) {
+                            buf.ghostShiftX = off;
+                            SimEnd robustEnd;
+                            int ret = simulateOrbs(layer, p1, p2, dual, bestK, down, horizon, hold, horizon, &robustEnd);
+                            buf.ghostShiftX = 0.f;
+                            if (ret < horizon) {
+                                say("skip MORE TIME +{}t: not robust", bestK);
+                                bestK = 0;
+                                break;
+                            }
+                        }
+                    }
+                }
                 if (bestK > 0 && !buf.train) {
                     noteSave(layer, bestK);
                     say("MORE TIME {}{} +{}t: crash t{} -> {} (died here {}x)", down ? "press" : "release", tickTag, bestK, crash0,
@@ -4360,17 +3777,6 @@ namespace {
                 }
                 else {
                     say("pass {}{}: safe now (survives the {}t look-ahead)", down ? "press" : "release", tickTag, horizon);
-                }
-            }
-            // v2.82: a robot press that's only safe with a hold unlike your usual one
-            if (robotPress && baseHold > 0) {
-                int usual = robotHold.pick(st(20), 50);
-                if (std::abs(baseHold - usual) >= st(3)) {
-                    if (buf.explain) {
-                        say("robot: safe with a {} hold ({}t, you usually hold {}t)", baseHold > usual ? "longer" : "shorter", baseHold,
-                            usual);
-                    }
-                    releaseAfter = baseHold;  // the path view / drift check show the hold that works
                 }
             }
             decided(layer, p1, p2, dual, 0, down, horizon, releaseAfter);
@@ -4425,9 +3831,9 @@ namespace {
         // +32t..+40t "saves" that died ~130 ticks later, every time); those clicks now go
         // through untouched instead of being moved by up to 10 frames for nothing.
         // v2.75: robot jumps and UFO / swing flaps too (no more half saves there either)
-        int needed = (groundPress || robotPress || robotRelease || ufoPress) ? horizon : std::min(horizon, base + st(12));
+        int needed = (groundPress || robotPress || ufoPress) ? horizon : std::min(horizon, base + st(12));
         int learned = memoryDelay(slice);
-        if (learned >= searchFrom && learned <= maxDelay && !(anyWave && buf.waveV46)) {
+        if (learned > 0 && learned <= maxDelay && !(anyWave && buf.waveV46)) {
             int target = needed;
             SimEnd e;
             int ret = scoreAt(learned, target, &e);
@@ -4442,9 +3848,6 @@ namespace {
                   : robotPress    ? searchTwoPass(horizon, maxDelay, base, &landed, [&](int k, int target, SimEnd* e) {
                         return robotScore(layer, p1, p2, dual, k, horizon, target, e);
                     }, true)
-                  : robotRelease  ? searchSmallest(horizon, maxDelay, base, &landed, [&](int k, int target, SimEnd* e) {
-                        return simulateOrbs(layer, p1, p2, dual, k, false, horizon, -1, target, e);
-                    }, searchBudget(), false, true)
                   : spiderPress   ? searchTwoPass(horizon, maxDelay, base, &landed, [&](int k, int target, SimEnd* e) {
                         return spiderScore(layer, p1, p2, dual, k, horizon, releaseAfter, target, e);
                     })
@@ -4456,21 +3859,6 @@ namespace {
                     }, true)
                                   : searchDelay(layer, p1, p2, dual, down, anyWave, horizon, maxDelay, releaseAfter, base, &landed,
                                         groundPress);
-        }
-        // v2.85 no-hitch: the search ran out of time before trying every delay. Your click waits
-        // one tick and the search goes on from there with fresh time (the delays it already
-        // tried all crashed, so waiting a tick loses nothing), instead of giving up.
-        int resumes = resuming ? resumeEntry.resumes : 0;
-        if (saved <= 0 && buf.noHitch && budgetCutK > 0 && budgetCutK < maxDelay && resumes < MAX_RESUMES &&
-            !(anyWave && buf.waveV46)) {
-            QueuedInput next { std::max(0, 1 - early), down, true, budgetCutK, (resuming ? resumeEntry.elapsed : 0) + 1, resumes + 1 };
-            if (buf.explain) {
-                say("search goes on next tick (tried up to +{}t of {}t)", budgetCutK + (resuming ? resumeEntry.elapsed : 0),
-                    maxDelay + (resuming ? resumeEntry.elapsed : 0));
-            }
-            buf.shift = 1;
-            buf.queue.push_back(next);
-            return true;
         }
         if (saved <= 0) {
             say("no save: {}{} dies in {}t (max {}t, best +{}t -> {}t of {}){}", down ? "press" : "release", tickTag, base, maxDelay,
@@ -4540,8 +3928,7 @@ namespace {
             releaseAfter = robotUsedHold;  // the path view / drift check show the hold that works
         }
         noteSave(layer, saved);
-        say("SAVED {}{} +{}t ({:g}f)  {}->{}  [max {}]{}{}", down ? "press" : "release", tickTag, saved, saved * TICK, base, landed, maxDelay,
-            resuming ? fmt::format("  (search went on {}t)", resumeEntry.elapsed) : std::string(),
+        say("SAVED {}{} +{}t ({:g}f)  {}->{}  [max {}]{}", down ? "press" : "release", tickTag, saved, saved * TICK, base, landed, maxDelay,
             robustNote ? std::string("  (robust)")
             : fromMemory ? std::string("  (memory)")
             : cubeStyleWave && marginUsed ? std::string("  +margin")
@@ -4552,8 +3939,17 @@ namespace {
         return true;
     }
 
+    void setStage(int stage);
+
     void cycleStage(int dir = 1) {
-        buf.stage = (buf.stage + dir + STAGE_COUNT) % STAGE_COUNT;
+        setStage((buf.stage + dir + STAGE_COUNT) % STAGE_COUNT);
+    }
+
+    void setStage(int stage) {
+        buf.stage = std::clamp(stage, 0, STAGE_COUNT - 1);
+        // v2.59: the stage is one setting for every level and survives restarts.
+        // v2.87: it lives in config.json now (key "stage").
+        (void)cfg::config().set("stage", cfg::Val::number(buf.stage));
         resetPending();
         // A delayed input that was waiting is dropped; the game gets what you're really
         // holding now (otherwise, with the buffer switched off, it never would).
@@ -4563,20 +3959,37 @@ namespace {
         }
         applyStage();
         readSettings();
+        refreshOverlays();
         saveProfile();
-        Mod::get()->setSavedValue("stage", buf.stage);  // v2.58: one stage for every level, kept on restart
-        say("Stage (6) -> {}", stageText());
-        refreshAutoTag();
-        refreshWatermark();
-        refreshPanel();
+        say("stage -> {}", stageText());
     }
 
     // v2.4 wave auto-release (practice mode only): while you hold in wave, check every
     // tick whether holding crashes within the next `autoWindow` ticks. If it does and
     // letting go now clearly survives longer, let go for you. Your own release later is
     // swallowed, and your next press works as normal.
+    // v2.87.1 fix-auto-throttle: auto-release / auto-click run ghost simulations on every physics update.
+    // A check that took longer than the prediction budget makes the next ones wait about 1 frame (4 ticks);
+    // cheap checks never set a cool-down, so the small auto-release window isn't missed.
+    int autoCooldownUntil = 0;
+    struct AutoThrottle {
+        std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+        ~AutoThrottle() {
+            if (buf.fixAutoThrottle && std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count() > buf.userBudget) {
+                autoCooldownUntil = tickCount + st(4);
+            }
+        }
+    };
+
     void tryAutoRelease(PlayLayer* layer, PlayerObject* p1) {
         if ((!buf.autoRelease && !buf.robotAutoRelease && !buf.dashAutoRelease) || buf.autoReleased || layer->m_isPlatformer) {
+            return;
+        }
+        // v2.87.1 fix-training-auto: training mode never touches your inputs (7.2)
+        if (buf.fixTrainingAuto && buf.train) {
+            return;
+        }
+        if (buf.fixAutoThrottle && tickCount < autoCooldownUntil) {
             return;
         }
         if (!layer->m_isPracticeMode && !buf.autoNormalRuns) {
@@ -4598,6 +4011,7 @@ namespace {
         }
         bool mini = (p1->m_isDart && p1->m_vehicleSize < 1.f) || (p2 && p2->m_isDart && p2->m_vehicleSize < 1.f);
 
+        AutoThrottle throttle;
         int window = st(std::clamp(buf.autoWindow, 2, 24));
         buf.sawMover = false;
         buf.skipPress = true;
@@ -4629,20 +4043,23 @@ namespace {
         say("AUTO release{}: holding dies in {}t, letting go lives {}t", dash ? " (dash)" : (robot ? " (robot)" : ""), hold, release);
     }
 
-    // v2.80 auto-click (off by default; practice mode only unless 'Auto-release in normal
-    // runs' is on, then the AUTO INPUTS ON tag shows): while you're not holding, check every
-    // step whether doing nothing crashes within the auto window. If it does and a click right
-    // now (with your usual hold) is fully safe, the mod clicks for you, lets go after that
-    // hold, and swallows your own click if it still comes. Cube, ball, UFO, robot, spider and
-    // swing; not wave / ship (constant control) or while dashing.
+    // v2.79 auto-click: while you're not holding, check whether doing nothing crashes within
+    // the auto-release window. If it does and a click right now (held for your usual tap) is
+    // fully safe, click for you; your own click, if it still comes, is swallowed.
     void tryAutoClick(PlayLayer* layer, PlayerObject* p1) {
-        if (!buf.autoClick || buf.autoReleased || buf.autoClicked || layer->m_isPlatformer) {
+        if (!buf.autoClick || !buf.enabled || buf.autoClicked || buf.swallowRelease || buf.autoReleased || layer->m_isPlatformer) {
+            return;
+        }
+        if (buf.fixTrainingAuto && buf.train) {  // v2.87.1 fix-training-auto (7.2)
+            return;
+        }
+        if (buf.fixAutoThrottle && tickCount < autoCooldownUntil) {
             return;
         }
         if (!layer->m_isPracticeMode && !buf.autoNormalRuns) {
             return;
         }
-        if (!buf.queue.empty() || buf.realInput || buf.appliedInput || !buf.isPlayer1 || !buf.ghost1) {
+        if (!buf.queue.empty() || buf.realInput || buf.appliedInput || !buf.isPlayer1 || !buf.ghost1 || buf.sinceInput < st(4)) {
             return;
         }
         if (layer->m_level && layer->m_level->m_twoPlayerMode) {
@@ -4650,12 +4067,14 @@ namespace {
         }
         bool dual = layer->m_gameState.m_isDualMode && layer->m_player2;
         auto* p2 = dual ? layer->m_player2 : nullptr;
-        auto skipMode = [](PlayerObject* p) { return p && (p->m_isDart || p->m_isShip || p->m_isDashing); };
-        if (p1->m_isDead || skipMode(p1) || skipMode(p2)) {
+        auto skipMode = [](PlayerObject* p) { return p->m_isDart || p->m_isShip || p->m_isDashing; };
+        if (p1->m_isDead || skipMode(p1) || (p2 && skipMode(p2))) {
             return;
         }
+        bool robot = p1->m_isRobot || (p2 && p2->m_isRobot);
+        bool flyer = isFlying(p1) || (p2 && isFlying(p2));
 
-        // 1. cheap: does doing nothing crash soon?
+        AutoThrottle throttle;
         int window = st(std::clamp(buf.autoWindow, 2, 24));
         buf.sawMover = false;
         buf.skipPress = true;
@@ -4667,38 +4086,25 @@ namespace {
         if (idle >= window || buf.ghostHitPortal) {
             return;
         }
-
-        // 2. a click now, held as long as you usually hold, must be fully safe
-        bool flyer = isFlying(p1) || (p2 && isFlying(p2));
         int horizon = st(flyer ? 48 : std::clamp(buf.groundHorizon, 48, 240));
-        int hold = std::max(1, holdEstimate());
+        int hold = robot ? robotHold.pick(st(20), 50) : holdEstimate();
         buf.trackMovers = buf.avoidMovers;
-        int press = simulateOrbs(layer, p1, p2, dual, 0, true, horizon, hold, horizon, &end);
+        int click = simulateOrbs(layer, p1, p2, dual, 0, true, horizon, hold, horizon, &end);
         buf.trackMovers = false;
-        if (press < horizon || (buf.avoidMovers && buf.sawMover)) {
+        if (click < horizon || (buf.avoidMovers && buf.sawMover)) {
             return;
         }
         buf.autoClicked = true;
-        buf.autoClickTick = tickCount;
+        buf.autoClickAge = 0;
         sendButton(layer, true);
         queueInput(hold, false);
-        say("AUTO click: doing nothing dies in {}t, clicking now is safe (hold {}t)", idle, hold);
-    }
-
-    // v2.85 no-hitch: the decision for a click whose search ran out of time goes on, from where
-    // you are now. No save found: the click goes to the game now.
-    void resumeClick(PlayLayer* layer, QueuedInput const& q) {
-        resumeNow = true;
-        resumeEntry = q;
-        bool held = intercept(layer, q.down, buf.isPlayer1);
-        resumeNow = false;
-        sweepGhostLayer();
-        if (!held) {
-            sendButton(layer, q.down);
-        }
+        say("AUTO click{}: doing nothing dies in {}t, clicking (hold {}t) is safe", robot ? " (robot)" : "", idle, hold);
     }
 
     void deliverPending(PlayLayer* layer, PlayerObject* player) {
+        if (buf.autoClicked && ++buf.autoClickAge > st(24)) {
+            buf.autoClicked = false;  // your click never came: the next one is yours again
+        }
         if (buf.sinceInput <= 998) {
             ++buf.sinceInput;
         }
@@ -4706,6 +4112,14 @@ namespace {
         // the next attempt)
         if (player->m_isDead) {
             return;
+        }
+        // v2.87.1 fix-practice-queue: practice mode ended (or "practice only" was switched on) while a
+        // delayed input was waiting: drop it and give the game your real button, like setStage does
+        if (buf.fixPracticeQueue && !buf.queue.empty() && buf.practiceOnly && !layer->m_isPracticeMode) {
+            resetPending();
+            if (buf.appliedInput != buf.realInput && !buf.autoReleased) {
+                sendButton(layer, buf.realInput);
+            }
         }
         if ((buf.avoidMovers || buf.predictMovers) && !watched.empty()) {
             updateWatched();
@@ -4727,12 +4141,8 @@ namespace {
             buf.autoReleased = false;
         }
 
-        // v2.80: an auto-click you never followed up on ends after a while
-        if (buf.autoClicked && !buf.realInput && tickCount - buf.autoClickTick > st(30)) {
-            buf.autoClicked = false;
-        }
         if (buf.queue.empty()) {
-            if (buf.appliedInput != buf.realInput && !buf.autoReleased && !buf.autoClicked) {
+            if (buf.appliedInput != buf.realInput && !buf.autoReleased) {
                 sendButton(layer, buf.realInput);
             }
             tryAutoRelease(layer, player);
@@ -4744,13 +4154,6 @@ namespace {
         // Check before decrementing: an input queued with N ticks fires right before
         // physics step N, which is exactly what simulate(delay = N) tested.
         while (!buf.queue.empty() && buf.queue.front().ticksLeft <= 0) {
-            if (buf.queue.front().resume) {
-                // v2.85 no-hitch: the search for this click goes on now
-                auto q = buf.queue.front();
-                buf.queue.pop_front();
-                resumeClick(layer, q);
-                continue;
-            }
             bool down = buf.queue.front().down;
             buf.queue.pop_front();
             buf.releaseShift = down ? buf.shift : 0;
@@ -4767,969 +4170,190 @@ namespace {
     }
 }
 
-// v2.88 menu: a draggable window in a space theme (night-sky gradient, nebula, twinkling
-// stars, the odd shooting star) with a tab for each category: Buffer, Prediction, Modes,
-// Custom (each game mode's own frames) and Tools. Opens with the menu key in a level or the
-// heart button on the main menu.
-class BufferMenu : public geode::Popup {
-    struct Option {
-        char const* key;    // mod setting, or nullptr for the runtime path view
-        char const* label;
-    };
-    static constexpr Option PREDICTION[] = {
-        { "robust-saves", "Robust saves" },
-        { "orb-align", "Orb alignment" },
-        { "orb-timing", "Orb timing" },
-        { "predict-moving-objects", "Moving objects" },
-        { "predict-move-triggers", "Move triggers" },
-        { "predict-through-portals", "Through portals" },
-        { "plan-next-click", "Two clicks ahead" },
-        { "no-hitch-searches", "No-hitch searches" },
-        { "level-memory", "Level memory" },
-        { "more-time-death-spots", "More time at deaths" },
-    };
-    static constexpr Option MODES[] = {
-        { "low-latency", "Low latency" },
-        { "cbf-sync", "CBF sync" },
-        { "ship-buffer", "Ship buffering" },
-        { "robot-smart", "Smart robot" },
-        { "spider-smart", "Smart spider" },
-        { "ufo-smart", "Smart UFO" },
-        { "ball-smart", "Smart ball" },
-        { "swing-smart", "Smart swing" },
-        { "auto-click", "Auto-click (practice)" },
-    };
-    static constexpr Option TOOLS[] = {
-        { nullptr, "Path view" },
-        { "training-mode", "Training (hints)" },
-        { "death-heatmap", "Death heatmap" },
-        { "save-ding", "Ding on save" },
-        { "performance-mode", "Performance mode" },
-        { "explain-inputs", "Explain inputs" },
-    };
-    static constexpr char const* TABS[] = { "Buffer", "Prediction", "Modes", "Custom", "Tools" };
-
-    struct Theme {
-        ccColor3B main, soft, accent, bg;
-        char const* button;
-    };
-
-public:
-    // the "Menu theme" setting picks the accent colour (purple by default)
-    static Theme currentTheme() {
-        auto name = Mod::get()->getSettingValue<std::string>("menu-theme");
-        if (name == "Pink") {
-            return { { 255, 120, 200 }, { 255, 205, 230 }, { 215, 190, 255 }, { 255, 195, 235 }, "GJ_button_02.png" };
-        }
-        if (name == "Blue") {
-            return { { 90, 170, 255 }, { 205, 228, 255 }, { 170, 210, 255 }, { 170, 205, 255 }, "GJ_button_06.png" };
-        }
-        if (name == "Green") {
-            return { { 90, 225, 150 }, { 210, 255, 220 }, { 180, 240, 200 }, { 170, 235, 190 }, "GJ_button_01.png" };
-        }
-        if (name == "Dark") {
-            return { { 170, 150, 230 }, { 225, 225, 235 }, { 170, 170, 190 }, { 90, 85, 110 }, "GJ_button_04.png" };
-        }
-        return { { 166, 107, 255 }, { 220, 195, 255 }, { 200, 170, 255 }, { 205, 170, 255 }, "GJ_button_02.png" };
-    }
-
-private:
-    static constexpr float W = 430.f;
-    static constexpr float H = 272.f;
-    static constexpr float TITLE = 28.f;
-    static constexpr float SIDE = 100.f;
-    static constexpr float ROW = 21.f;
-
-    static inline BufferMenu* s_open = nullptr;
-    static inline int s_tab = 0;
-    static inline bool s_moved = false;
-    static inline CCPoint s_pos {};
-
-    Theme m_t = currentTheme();
-    ccColor3B m_text { 232, 234, 255 };
-    ccColor3B m_muted { 142, 148, 190 };
-    ccColor3B m_cyan { 110, 230, 255 };
-
-    CCMenu* m_frameMenu = nullptr;
-    CCNode* m_tabsNode = nullptr;
-    CCNode* m_page = nullptr;
-    CCMenu* m_pageMenu = nullptr;
-    CCLabelBMFont* m_stage = nullptr;
-    CCLabelBMFont* m_status = nullptr;
-    CCLabelBMFont* m_tpsLabel = nullptr;
-    std::vector<Option const*> m_options;
-    std::vector<CCDrawNode*> m_switches;
-    std::vector<CCLabelBMFont*> m_switchLabels;
-    std::array<CCLabelBMFont*, 8> m_modeValues {};
-    struct ModeSlider {
-        int mode;
-        float x0, x1, y;  // in the page's space
-        CCDrawNode* draw;
-    };
-    std::vector<ModeSlider> m_sliders;
-    int m_dragSlider = -1;
-    CCDrawNode* m_perModeSwitch = nullptr;
-    bool m_dragging = false;
-    float m_shootTimer = 2.f;
-
-    static constexpr int TPS_MIN = 240;
-    static constexpr int TPS_MAX = 1000;
-
-    // CCDrawNode blends premultiplied colours: a see-through colour has to be darkened by its
-    // alpha (v2.88's white cards and bright blocks were plain colours drawn at full strength)
-    static ccColor4F col(ccColor3B c, float a) {
-        return { c.r / 255.f * a, c.g / 255.f * a, c.b / 255.f * a, a };
-    }
-
-    // a filled circle as a polygon (the game's drawDot draws squares)
-    static void circle(CCDrawNode* d, CCPoint c, float r, ccColor4F fill, int segments = 28, float border = 0.f,
-        ccColor4F borderColor = { 0, 0, 0, 0 }) {
-        std::vector<CCPoint> pts;
-        for (int i = 0; i < segments; ++i) {
-            float a = i * 2.f * 3.14159265f / segments;
-            pts.push_back({ c.x + r * std::cos(a), c.y + r * std::sin(a) });
-        }
-        d->drawPolygon(pts.data(), static_cast<unsigned>(pts.size()), fill, border, borderColor);
-    }
-
-    // a rounded rectangle (convex, so one polygon)
-    static void roundRect(CCDrawNode* d, CCRect r, float rad, ccColor4F fill, float border = 0.f, ccColor4F borderColor = { 0, 0, 0, 0 }) {
-        rad = std::min({ rad, r.size.width / 2.f, r.size.height / 2.f });
-        std::vector<CCPoint> pts;
-        CCPoint centers[] = { { r.getMaxX() - rad, r.getMaxY() - rad }, { r.getMinX() + rad, r.getMaxY() - rad },
-            { r.getMinX() + rad, r.getMinY() + rad }, { r.getMaxX() - rad, r.getMinY() + rad } };
-        for (int c = 0; c < 4; ++c) {
-            for (int i = 0; i <= 6; ++i) {
-                float a = (c * 90.f + i * 15.f) * 3.14159265f / 180.f;
-                CCPoint p { centers[c].x + rad * std::cos(a), centers[c].y + rad * std::sin(a) };
-                // v2.88.2: no repeated points (where corners meet on round shapes): the outline
-                // turned a zero-length edge into a stray line sticking out of every round button
-                if (pts.empty() || ccpDistance(pts.back(), p) > 0.05f) {
-                    pts.push_back(p);
-                }
-            }
-        }
-        while (pts.size() > 2 && ccpDistance(pts.back(), pts.front()) <= 0.05f) {
-            pts.pop_back();
-        }
-        d->drawPolygon(pts.data(), static_cast<unsigned>(pts.size()), fill, border, borderColor);
-    }
-
-    // v2.89 fonts (bundled, OFL): Orbitron for titles, tabs and headings, Exo 2 for the rest
-    static char const* bodyFont() {
-        return "exo2.fnt"_spr;
-    }
-
-    static char const* headFont() {
-        return "orbitron.fnt"_spr;
-    }
-
-    static constexpr float BODY_K = 1.f;   // size of Exo 2 next to the old chat font
-    static constexpr float HEAD_K = 0.8f;  // Orbitron is wide
-
-    CCLabelBMFont* label(CCNode* parent, std::string const& str, float scale, ccColor3B color, CCPoint at, CCPoint anchor = { 0.5f, 0.5f },
-        bool head = false) {
-        auto* l = CCLabelBMFont::create(str.c_str(), head ? headFont() : bodyFont());
-        l->setScale(scale * (head ? HEAD_K : BODY_K));
-        l->setColor(color);
-        l->setAnchorPoint(anchor);
-        l->setPosition(at);
-        parent->addChild(l, 3);
-        return l;
-    }
-
-    // a flat pill button: filled with the accent (primary) or glassy with an accent edge
-    CCMenuItemSpriteExtra* button(CCMenu* menu, std::string const& str, SEL_MenuHandler handler, CCPoint center, float width,
-        bool primary = false, int tag = 0, float height = 18.f) {
-        auto* node = CCNode::create();
-        node->setContentSize({ width, height });
-        auto* d = CCDrawNode::create();
-        roundRect(d, { 0.f, 0.f, width, height }, height / 2.f, primary ? col(m_t.main, 0.9f) : col({ 255, 255, 255 }, 0.07f), 0.6f,
-            col(primary ? m_t.soft : m_t.main, primary ? 0.6f : 0.55f));
-        node->addChild(d);
-        auto* l = CCLabelBMFont::create(str.c_str(), bodyFont());
-        l->setScale(0.5f * BODY_K);
-        l->setColor(primary ? ccColor3B { 255, 255, 255 } : m_text);
-        l->setPosition({ width / 2.f, height / 2.f + 0.5f });
-        l->limitLabelWidth(width - 8.f, 0.5f * BODY_K, 0.2f);
-        node->addChild(l);
-        auto* item = CCMenuItemSpriteExtra::create(node, this, handler);
-        item->m_scaleMultiplier = 1.05f;
-        item->setTag(tag);
-        item->setPosition(center);
-        menu->addChild(item);
-        return item;
-    }
-
-    void drawSwitch(CCDrawNode* d, bool on) {
-        d->clear();
-        roundRect(d, { 0.f, 0.f, 26.f, 13.f }, 6.5f, on ? col(m_t.main, 0.95f) : col({ 70, 74, 110 }, 0.9f), 0.5f,
-            col(on ? m_t.soft : ccColor3B { 110, 115, 160 }, 0.6f));
-        if (on) {
-            circle(d, { 19.5f, 6.5f }, 7.f, col(m_cyan, 0.18f));
-        }
-        circle(d, { on ? 19.5f : 6.5f, 6.5f }, 4.6f, col({ 255, 255, 255 }, on ? 1.f : 0.8f));
-    }
-
-    CCMenuItemSpriteExtra* switchItem(CCPoint center, bool on, SEL_MenuHandler handler, int tag, CCDrawNode** out) {
-        auto* node = CCNode::create();
-        node->setContentSize({ 26.f, 13.f });
-        auto* d = CCDrawNode::create();
-        node->addChild(d);
-        drawSwitch(d, on);
-        auto* item = CCMenuItemSpriteExtra::create(node, this, handler);
-        item->m_scaleMultiplier = 1.08f;
-        item->setTag(tag);
-        item->setPosition(center);
-        m_pageMenu->addChild(item);
-        *out = d;
-        return item;
-    }
-
-    // your icon for a game mode (MODE_NAMES order = the game's icon types), in your colours
-    static CCNode* modeIcon(int mode) {
-        auto* gm = GameManager::get();
-        int ids[] = { gm->getPlayerFrame(), gm->getPlayerShip(), gm->getPlayerBall(), gm->getPlayerBird(), gm->getPlayerDart(),
-            gm->getPlayerRobot(), gm->getPlayerSpider(), gm->getPlayerSwing() };
-        auto* icon = SimplePlayer::create(0);
-        icon->updatePlayerFrame(ids[mode], static_cast<IconType>(mode));
-        icon->setColor(gm->colorForIdx(gm->getPlayerColor()));
-        icon->setSecondColor(gm->colorForIdx(gm->getPlayerColor2()));
-        if (gm->getPlayerGlow()) {
-            icon->setGlowOutline(gm->colorForIdx(gm->getPlayerGlowColor()));
-        }
-        icon->setScale(mode == 5 || mode == 6 ? 0.42f : 0.5f);
-        return icon;
-    }
-
-    static bool optionValue(Option const& o) {
-        return o.key ? Mod::get()->getSettingValue<bool>(o.key) : buf.showPath;
-    }
-
-    // a switch row: label on the left, switch on the right
-    void optionRow(Option const& o, float x, float y, float width) {
-        CCDrawNode* d = nullptr;
-        switchItem({ x + width - 15.f, y }, optionValue(o), menu_selector(BufferMenu::onToggle), static_cast<int>(m_options.size()), &d);
-        auto* l = label(m_page, o.label, 0.52f, optionValue(o) ? m_text : m_muted, { x, y }, { 0.f, 0.5f });
-        l->limitLabelWidth(width - 36.f, 0.52f, 0.2f);
-        m_options.push_back(&o);
-        m_switches.push_back(d);
-        m_switchLabels.push_back(l);
-    }
-
-    void optionGrid(Option const* options, size_t count, float top) {
-        float left = SIDE + 14.f;
-        float colW = (W - SIDE - 34.f) / 2.f;
-        size_t rows = (count + 1) / 2;
-        for (size_t i = 0; i < count; ++i) {
-            float x = left + (i / rows) * (colW + 10.f);
-            float y = top - (i % rows) * ROW;
-            optionRow(options[i], x, y, colW);
-        }
-    }
-
-    // ---------- the window ----------
-
-    void buildFrame() {
-        // a soft glow around the window: rings of the accent fading outwards
-        auto* glow = CCDrawNode::create();
-        for (int i = 7; i >= 1; --i) {
-            float g = i * 1.7f;
-            roundRect(glow, { -g, -g, W + 2.f * g, H + 2.f * g }, 12.f + g, col(m_t.main, 0.022f));
-        }
-        m_mainLayer->addChild(glow, -3);
-
-        // the sky, clipped to the window's shape. v2.90: a black night sky full of stars
-        auto* stencil = CCDrawNode::create();
-        roundRect(stencil, { 0.f, 0.f, W, H }, 12.f, { 1, 1, 1, 1 });
-        auto* clip = CCClippingNode::create(stencil);
-        m_mainLayer->addChild(clip, -2);
-        auto* sky = CCLayerGradient::create({ 2, 2, 7, 253 }, { 7, 5, 16, 253 });
-        sky->setContentSize({ W, H });
-        clip->addChild(sky);
-        // the faintest hint of the milky way across the sky
-        auto* haze = CCDrawNode::create();
-        for (int i = 0; i < 24; ++i) {
-            float t = i / 23.f;
-            CCPoint c { -20.f + t * (W + 40.f), H * 0.85f - t * H * 0.7f };
-            circle(haze, c, 60.f, col({ 120, 110, 200 }, 0.006f), 40);
-            circle(haze, c, 34.f, col({ 160, 150, 230 }, 0.006f), 32);
-        }
-        clip->addChild(haze);
-        auto drift = [](CCNode* node, CCPoint by, float period) {
-            node->runAction(CCRepeatForever::create(CCSequence::create(CCEaseSineInOut::create(CCMoveBy::create(period, by)),
-                CCEaseSineInOut::create(CCMoveBy::create(period, ccpNeg(by))), nullptr)));
-        };
-        uint32_t seed = 1234567;
-        auto rnd = [&seed] {
-            seed = seed * 1103515245u + 12345u;
-            return static_cast<float>((seed >> 8) & 0xffff) / 65535.f;
-        };
-        auto tint = [&]() -> ccColor3B {
-            float r = rnd();
-            return r < 0.12f ? m_cyan : r < 0.22f ? ccColor3B { 255, 225, 190 } : r < 0.30f ? m_t.soft : ccColor3B { 255, 255, 255 };
-        };
-        // two layers of stars drifting at different speeds (far = small and slow, near = bigger)
-        for (int layer = 0; layer < 2; ++layer) {
-            auto* field = CCNode::create();
-            clip->addChild(field);
-            drift(field, layer == 0 ? CCPoint { -8.f, 3.f } : CCPoint { -18.f, 7.f }, layer == 0 ? 22.f : 14.f);
-            int count = layer == 0 ? 150 : 60;
-            for (int i = 0; i < count; ++i) {
-                float size = layer == 0 ? 0.5f + rnd() * 0.5f : 0.9f + rnd() * 0.8f;
-                auto* star = CCLayerColor::create({ 255, 255, 255, 255 }, size, size);
-                star->setPosition({ rnd() * (W + 50.f) - 25.f, rnd() * (H + 30.f) - 15.f });
-                star->setColor(tint());
-                GLubyte hi = static_cast<GLubyte>((layer == 0 ? 110 : 170) + rnd() * 85);
-                GLubyte lo = static_cast<GLubyte>(15 + rnd() * 45);
-                star->setOpacity(hi);
-                float t = 0.6f + rnd() * 2.2f;
-                star->runAction(CCRepeatForever::create(CCSequence::create(CCDelayTime::create(rnd() * 3.f),
-                    CCFadeTo::create(t, lo), CCFadeTo::create(t, hi), nullptr)));
-                field->addChild(star);
-            }
-            if (layer == 1) {
-                // the shiny ones: four-pointed sparkles that grow, shrink and turn
-                for (int i = 0; i < 14; ++i) {
-                    auto* glint = CCDrawNode::create();
-                    ccColor3B c = tint();
-                    float arm = 3.5f + rnd() * 3.5f;
-                    float w = arm * 0.16f;
-                    CCPoint h1[] = { { 0.f, arm }, { w, 0.f }, { 0.f, -arm }, { -w, 0.f } };
-                    CCPoint h2[] = { { arm, 0.f }, { 0.f, w }, { -arm, 0.f }, { 0.f, -w } };
-                    circle(glint, { 0.f, 0.f }, arm * 0.55f, col(c, 0.10f), 16);
-                    glint->drawPolygon(h1, 4, col(c, 0.95f), 0.f, { 0, 0, 0, 0 });
-                    glint->drawPolygon(h2, 4, col(c, 0.95f), 0.f, { 0, 0, 0, 0 });
-                    circle(glint, { 0.f, 0.f }, w * 1.3f, col({ 255, 255, 255 }, 1.f), 10);
-                    glint->setPosition({ 10.f + rnd() * (W - 20.f), 10.f + rnd() * (H - 20.f) });
-                    float s0 = 0.35f + rnd() * 0.25f;
-                    glint->setScale(s0);
-                    glint->setRotation(rnd() * 45.f);
-                    float t = 1.f + rnd() * 1.8f;
-                    glint->runAction(CCRepeatForever::create(CCSequence::create(CCDelayTime::create(rnd() * 3.f),
-                        CCEaseSineInOut::create(CCScaleTo::create(t, s0 * 2.2f)), CCEaseSineInOut::create(CCScaleTo::create(t, s0)), nullptr)));
-                    glint->runAction(CCRepeatForever::create(CCRotateBy::create(6.f + rnd() * 6.f, rnd() < 0.5f ? 45.f : -45.f)));
-                    field->addChild(glint);
-                }
-            }
-        }
-        // a light sweeping along the title line now and then
-        auto* shine = CCLayerGradient::create({ 255, 255, 255, 0 }, { 255, 255, 255, 210 }, { 1.f, 0.f });
-        shine->setContentSize({ 40.f, 1.f });
-        shine->setPosition({ -40.f, H - TITLE });
-        clip->addChild(shine, 5);
-        shine->runAction(CCRepeatForever::create(CCSequence::create(CCDelayTime::create(2.5f),
-            CCEaseSineInOut::create(CCMoveBy::create(1.6f, { W + 40.f, 0.f })), CCPlace::create({ -40.f, H - TITLE }), nullptr)));
-        m_sky = clip;
-
-        // edge, the sidebar's darker panel, the title's accent line
-        auto* chrome = CCDrawNode::create();
-        roundRect(chrome, { 0.f, 0.f, W, H }, 12.f, { 0, 0, 0, 0 }, 0.7f, col(m_t.main, 0.75f));
-        roundRect(chrome, { 1.5f, 1.5f, W - 3.f, H - 3.f }, 11.f, { 0, 0, 0, 0 }, 0.4f, col({ 255, 255, 255 }, 0.06f));
-        roundRect(chrome, { 7.f, 8.f, SIDE - 12.f, H - TITLE - 14.f }, 9.f, col({ 0, 0, 0 }, 0.28f), 0.4f, col({ 255, 255, 255 }, 0.05f));
-        m_mainLayer->addChild(chrome, -1);
-        auto* line = CCLayerGradient::create({ m_t.main.r, m_t.main.g, m_t.main.b, 230 }, { m_cyan.r, m_cyan.g, m_cyan.b, 0 }, { 1.f, 0.f });
-        line->setContentSize({ W - 24.f, 1.f });
-        line->setPosition({ 12.f, H - TITLE });
-        m_mainLayer->addChild(line, -1);
-
-        // the logo: a little planet with a tilted ring
-        auto* logo = CCDrawNode::create();
-        CCPoint lc { 21.f, H - TITLE / 2.f };
-        circle(logo, lc, 6.5f, col(m_t.main, 1.f));
-        circle(logo, lc + CCPoint { -1.6f, 1.8f }, 3.4f, col(m_t.soft, 0.45f));
-        std::vector<CCPoint> ring;
-        for (int i = 0; i <= 32; ++i) {
-            float a = i * 2.f * 3.14159265f / 32.f;
-            float x = 11.f * std::cos(a), y = 3.2f * std::sin(a);
-            float t = 0.38f;
-            ring.push_back(lc + CCPoint { x * std::cos(t) - y * std::sin(t), x * std::sin(t) + y * std::cos(t) });
-        }
-        for (size_t i = 0; i + 1 < ring.size(); ++i) {
-            logo->drawSegment(ring[i], ring[i + 1], 0.55f, col(m_cyan, 0.95f));
-        }
-        m_mainLayer->addChild(logo, 2);
-        // a moon going round the logo along its ring
-        auto* tilt = CCNode::create();
-        tilt->setPosition(lc);
-        tilt->setRotation(-0.38f * 180.f / 3.14159265f);
-        tilt->setScaleY(3.2f / 11.f);
-        m_mainLayer->addChild(tilt, 3);
-        auto* orbit = CCNode::create();
-        tilt->addChild(orbit);
-        auto* moon = CCDrawNode::create();
-        circle(moon, { 11.f, 0.f }, 1.7f, col({ 255, 255, 255 }, 1.f), 12);
-        orbit->addChild(moon);
-        orbit->runAction(CCRepeatForever::create(CCRotateBy::create(4.f, -360.f)));
-        label(m_mainLayer, "CLICK BEFORE FRAMES", 0.56f, m_text, { 38.f, H - TITLE / 2.f }, { 0.f, 0.5f }, true);
-        label(m_mainLayer, Mod::get()->getVersion().toVString(), 0.4f, m_muted, { W - 38.f, H - TITLE / 2.f }, { 1.f, 0.5f });
-
-        m_frameMenu = CCMenu::create();
-        m_frameMenu->setPosition({ 0.f, 0.f });
-        m_mainLayer->addChild(m_frameMenu, 5);
-        // close: a thin ring with an x
-        auto* node = CCNode::create();
-        node->setContentSize({ 18.f, 18.f });
-        auto* d = CCDrawNode::create();
-        circle(d, { 9.f, 9.f }, 8.f, col({ 255, 255, 255 }, 0.06f), 28, 0.5f, col(m_t.main, 0.8f));
-        d->drawSegment({ 6.2f, 6.2f }, { 11.8f, 11.8f }, 0.6f, col(m_text, 0.95f));
-        d->drawSegment({ 6.2f, 11.8f }, { 11.8f, 6.2f }, 0.6f, col(m_text, 0.95f));
-        node->addChild(d);
-        auto* close = CCMenuItemSpriteExtra::create(node, this, menu_selector(BufferMenu::onCloseButton));
-        close->setPosition({ W - 18.f, H - TITLE / 2.f });
-        m_frameMenu->addChild(close);
-    }
-
-    void buildTabs() {
-        if (m_tabsNode) {
-            m_tabsNode->removeFromParent();
-        }
-        m_tabsNode = CCNode::create();
-        m_mainLayer->addChild(m_tabsNode, 4);
-        auto* menu = CCMenu::create();
-        menu->setPosition({ 0.f, 0.f });
-        m_tabsNode->addChild(menu);
-        for (int i = 0; i < static_cast<int>(std::size(TABS)); ++i) {
-            float y = H - TITLE - 22.f - i * 27.f;
-            bool active = i == s_tab;
-            auto* node = CCNode::create();
-            node->setContentSize({ SIDE - 16.f, 22.f });
-            auto* d = CCDrawNode::create();
-            if (active) {
-                roundRect(d, { 0.f, 0.f, SIDE - 16.f, 22.f }, 7.f, col(m_t.main, 0.32f), 0.6f, col(m_t.main, 0.9f));
-                d->drawSegment({ 3.f, 6.f }, { 3.f, 16.f }, 1.2f, col(m_cyan, 1.f));
-            }
-            circle(d, { 12.f, 11.f }, 2.2f, active ? col(m_cyan, 1.f) : col(m_muted, 0.6f), 12);
-            node->addChild(d);
-            auto* l = CCLabelBMFont::create(TABS[i], headFont());
-            l->setScale(0.42f * HEAD_K);
-            l->setColor(active ? m_text : m_muted);
-            l->setAnchorPoint({ 0.f, 0.5f });
-            l->setPosition({ 22.f, 11.5f });
-            node->addChild(l);
-            auto* item = CCMenuItemSpriteExtra::create(node, this, menu_selector(BufferMenu::onTab));
-            item->m_scaleMultiplier = 1.04f;
-            item->setTag(i);
-            item->setPosition({ SIDE / 2.f, y });
-            menu->addChild(item);
-        }
-    }
-
-    // ---------- pages ----------
-
-    float pageTop() {
-        return H - TITLE - 16.f;
-    }
-
-    void heading(std::string const& title, std::string const& sub) {
-        label(m_page, title, 0.7f, m_text, { SIDE + 14.f, pageTop() }, { 0.f, 0.5f }, true);
-        if (!sub.empty()) {
-            label(m_page, sub, 0.42f, m_muted, { SIDE + 14.f, pageTop() - 14.f }, { 0.f, 0.5f })->limitLabelWidth(W - SIDE - 28.f, 0.42f, 0.2f);
-        }
-    }
-
-    // a translucent card behind a group of rows
-    void card(float top, float height) {
-        auto* d = CCDrawNode::create();
-        roundRect(d, { SIDE + 8.f, top - height, W - SIDE - 16.f, height }, 8.f, col({ 255, 255, 255 }, 0.045f), 0.5f, col(m_t.main, 0.35f));
-        m_page->addChild(d, 1);
-    }
-
-    void pageBuffer() {
-        heading("Buffer", "How much an early click can be held back, and the physics speed.");
-        float cx = SIDE + (W - SIDE) / 2.f;
-        float y = pageTop() - 40.f;
-        card(y + 13.f, 52.f);
-        label(m_page, "Stage", 0.5f, m_muted, { SIDE + 20.f, y }, { 0.f, 0.5f });
-        button(m_pageMenu, "<", menu_selector(BufferMenu::onStage), { cx - 20.f, y }, 22.f, false, -1);
-        button(m_pageMenu, ">", menu_selector(BufferMenu::onStage), { W - 30.f, y }, 22.f, false, 1);
-        m_stage = label(m_page, "", 0.55f, m_text, { (cx - 8.f + W - 42.f) / 2.f, y });
-        y -= 22.f;
-        char const* presets[] = { "Safe", "Balanced", "Aggressive" };
-        float pw = (W - SIDE - 40.f) / 3.f;
-        for (int i = 0; i < 3; ++i) {
-            button(m_pageMenu, presets[i], menu_selector(BufferMenu::onPreset), { SIDE + 20.f + pw / 2.f + i * (pw + 4.f), y }, pw, false, i);
-        }
-        y -= 32.f;
-        card(y + 11.f, 24.f);
-        label(m_page, "Physics TPS", 0.5f, m_muted, { SIDE + 20.f, y }, { 0.f, 0.5f });
-        button(m_pageMenu, "-", menu_selector(BufferMenu::onTps), { W - 92.f, y }, 22.f, false, -1);
-        button(m_pageMenu, "+", menu_selector(BufferMenu::onTps), { W - 30.f, y }, 22.f, false, 1);
-        m_tpsLabel = label(m_page, "", 0.55f, m_text, { W - 61.f, y });
-        y -= 30.f;
-        m_status = label(m_page, "", 0.45f, m_cyan, { SIDE + 14.f, y }, { 0.f, 0.5f });
-        if (buf.perMode) {
-            label(m_page, "Per-mode frames are on (Custom tab). Stage and presets turn them off.", 0.4f, m_t.soft, { SIDE + 14.f, y - 14.f },
-                { 0.f, 0.5f })->limitLabelWidth(W - SIDE - 28.f, 0.4f, 0.2f);
-        }
-        button(m_pageMenu, "Run check", menu_selector(BufferMenu::onRunCheck), { cx, 26.f }, 90.f, true);
-    }
-
-    void pageOptions(char const* title, char const* sub, Option const* options, size_t count) {
-        heading(title, sub);
-        float top = pageTop() - 40.f;
-        card(top + 12.f, ((count + 1) / 2) * ROW + 4.f);
-        optionGrid(options, count, top);
-    }
-
-    void pageCustom() {
-        heading("Custom", "Pick how many frames each game mode can be held back. 0 = no buffer.");
-        float y = pageTop() - 38.f;
-        card(y + 11.f, 24.f);
-        label(m_page, "Use per-mode frames", 0.52f, buf.perMode ? m_text : m_muted, { SIDE + 20.f, y }, { 0.f, 0.5f });
-        switchItem({ W - 30.f, y }, buf.perMode, menu_selector(BufferMenu::onPerMode), 0, &m_perModeSwitch);
-        y -= 30.f;
-        float colW = (W - SIDE - 34.f) / 2.f;
-        card(y + 12.f, 4 * 24.f + 2.f);
-        for (int i = 0; i < 8; ++i) {
-            float x = SIDE + 18.f + (i / 4) * (colW + 10.f);
-            float ry = y - (i % 4) * 24.f;
-            auto* icon = modeIcon(i);  // v2.89: your own icon for each mode instead of its name
-            icon->setPosition({ x + 12.f, ry });
-            m_page->addChild(icon, 3);
-            // v2.90: a slider instead of - / + (drag it; half-frame steps)
-            auto* track = CCDrawNode::create();
-            m_page->addChild(track, 2);
-            m_sliders.push_back({ i, x + 30.f, x + colW - 36.f, ry, track });
-            m_modeValues[i] = label(m_page, "", 0.52f, m_cyan, { x + colW - 15.f, ry });
-        }
-        label(m_page, "Drag a slider: half-frame steps, up to 10 frames. With this on, low latency's 1-frame limit doesn't apply.", 0.38f, m_muted,
-            { SIDE + 14.f, 22.f }, { 0.f, 0.5f })->limitLabelWidth(W - SIDE - 28.f, 0.38f, 0.2f);
-        refreshModes();
-    }
-
-    void pageTools() {
-        heading("Tools", "What you see while playing, plus stats and the log.");
-        float top = pageTop() - 40.f;
-        card(top + 12.f, 3 * ROW + 4.f);
-        optionGrid(TOOLS, std::size(TOOLS), top);
-        float y = top - 3 * ROW - 14.f;
-        float bw = (W - SIDE - 46.f) / 3.f;
-        float x0 = SIDE + 20.f + bw / 2.f;
-        button(m_pageMenu, "Stats", menu_selector(BufferMenu::onStats), { x0, y }, bw);
-        button(m_pageMenu, "Console", menu_selector(BufferMenu::onConsole), { x0 + bw + 6.f, y }, bw);  // phones have no F9
-        button(m_pageMenu, "Copy log", menu_selector(BufferMenu::onCopyLog), { x0 + 2.f * (bw + 6.f), y }, bw);
-        y -= 24.f;
-        float bw2 = (W - SIDE - 40.f) / 2.f;
-        float x2 = SIDE + 20.f + bw2 / 2.f;
-        button(m_pageMenu, "Forget this level", menu_selector(BufferMenu::onForget), { x2, y }, bw2);
-        button(m_pageMenu, "All settings", menu_selector(BufferMenu::onAllSettings), { x2 + bw2 + 6.f, y }, bw2);
-    }
-
-    void rebuildPage() {
-        if (m_page) {
-            m_page->removeFromParent();
-        }
-        m_stage = m_status = m_tpsLabel = nullptr;
-        m_perModeSwitch = nullptr;
-        m_modeValues.fill(nullptr);
-        m_sliders.clear();
-        m_dragSlider = -1;
-        m_options.clear();
-        m_switches.clear();
-        m_switchLabels.clear();
-        m_page = CCNode::create();
-        m_page->setPosition({ 14.f, 0.f });
-        m_page->runAction(CCEaseExponentialOut::create(CCMoveTo::create(0.35f, { 0.f, 0.f })));
-        m_mainLayer->addChild(m_page, 3);
-        m_pageMenu = CCMenu::create();
-        m_pageMenu->setPosition({ 0.f, 0.f });
-        m_page->addChild(m_pageMenu, 5);
-
-        switch (s_tab) {
-            case 1:
-                pageOptions("Prediction", "What the hidden ghost predicts before your click is let through.", PREDICTION, std::size(PREDICTION));
-                break;
-            case 2: pageOptions("Modes", "Per game mode helpers and latency.", MODES, std::size(MODES)); break;
-            case 3: pageCustom(); break;
-            case 4: pageTools(); break;
-            default: pageBuffer(); break;
-        }
-        buildTabs();
-        handleTouchPriority(this);
-        refresh();
-    }
-
-    void refresh() {
-        if (m_stage) {
-            m_stage->setString(stageText().c_str());
-            m_stage->limitLabelWidth(W - SIDE - 150.f, 0.55f, 0.2f);
-        }
-        if (m_tpsLabel) {
-            m_tpsLabel->setString(fmt::format("{}", Mod::get()->getSettingValue<int64_t>("tps")).c_str());
-        }
-        if (m_status) {
-            float dt = buf.tickLength > 0.001f ? buf.tickLength : TICK;
-            m_status->setString(fmt::format("physics {:.0f}/s   |   CBF {}   |   memory {} spots", 60.f / dt,
-                Loader::get()->isModLoaded("syzzi.click_between_frames") ? "on" : "off", memorySpots()).c_str());
-        }
-        for (size_t i = 0; i < m_switches.size(); ++i) {
-            bool on = optionValue(*m_options[i]);
-            drawSwitch(m_switches[i], on);
-            m_switchLabels[i]->setColor(on ? m_text : m_muted);
-        }
-        refreshModes();
-    }
-
-    void drawSlider(ModeSlider const& sl) {
-        auto* d = sl.draw;
-        d->clear();
-        float t = static_cast<float>(buf.modeTicks[sl.mode]) / MODE_TICKS_MAX;
-        float kx = sl.x0 + (sl.x1 - sl.x0) * t;
-        roundRect(d, { sl.x0, sl.y - 2.f, sl.x1 - sl.x0, 4.f }, 2.f, col({ 255, 255, 255 }, 0.12f));
-        if (kx - sl.x0 > 1.f) {
-            roundRect(d, { sl.x0, sl.y - 2.f, kx - sl.x0, 4.f }, 2.f, col(buf.perMode ? m_t.main : m_muted, buf.perMode ? 1.f : 0.6f));
-        }
-        circle(d, { kx, sl.y }, 7.5f, col(buf.perMode ? m_cyan : m_muted, 0.16f), 24);
-        circle(d, { kx, sl.y }, 5.f, col({ 255, 255, 255 }, buf.perMode ? 1.f : 0.75f), 24);
-    }
-
-    // a touch on a slider sets its mode's frames (snapped to half frames)
-    void slideTo(ModeSlider const& sl, CCPoint p) {
-        float t = std::clamp((p.x - sl.x0) / (sl.x1 - sl.x0), 0.f, 1.f);
-        int ticks = static_cast<int>(std::lround(t * MODE_TICKS_MAX / 2.f)) * 2;
-        if (ticks != buf.modeTicks[sl.mode]) {
-            buf.modeTicks[sl.mode] = ticks;
-            refreshModes();
-        }
-    }
-
-    void refreshModes() {
-        for (auto const& sl : m_sliders) {
-            drawSlider(sl);
-        }
-        for (int i = 0; i < 8; ++i) {
-            if (m_modeValues[i]) {
-                m_modeValues[i]->setString(fmt::format("{:g}f", buf.modeTicks[i] * TICK).c_str());
-                m_modeValues[i]->setColor(buf.perMode ? m_cyan : m_muted);
-            }
-        }
-        if (m_perModeSwitch) {
-            drawSwitch(m_perModeSwitch, buf.perMode);
-        }
-    }
-
-    // ---------- motion: shooting stars ----------
-
-    CCNode* m_sky = nullptr;
-
-    void update(float dt) override {
-        m_shootTimer -= dt;
-        if (m_shootTimer <= 0.f && m_sky) {
-            m_shootTimer = 3.5f + static_cast<float>(std::rand() % 400) / 100.f;
-            auto* streak = CCLayerGradient::create({ 255, 255, 255, 0 }, { 255, 255, 255, 220 }, { 1.f, 0.f });
-            streak->setContentSize({ 34.f, 1.2f });
-            streak->ignoreAnchorPointForPosition(false);
-            streak->setAnchorPoint({ 1.f, 0.5f });
-            float sx = 60.f + static_cast<float>(std::rand() % static_cast<int>(W - 60.f));
-            streak->setPosition({ sx, H + 10.f });
-            streak->setRotation(28.f);
-            m_sky->addChild(streak);
-            streak->runAction(CCSequence::create(
-                CCSpawn::create(CCMoveBy::create(0.9f, { -170.f, -90.f }), CCSequence::create(CCDelayTime::create(0.5f), CCFadeOut::create(0.4f), nullptr),
-                    nullptr),
-                CCRemoveSelf::create(), nullptr));
-        }
-    }
-
-    // ---------- dragging by the title bar ----------
-
-    bool ccTouchBegan(CCTouch* touch, CCEvent* event) override {
-        if (m_page) {
-            auto pp = m_page->convertToNodeSpace(touch->getLocation());
-            for (size_t i = 0; i < m_sliders.size(); ++i) {
-                auto const& sl = m_sliders[i];
-                if (pp.x >= sl.x0 - 9.f && pp.x <= sl.x1 + 9.f && std::abs(pp.y - sl.y) <= 10.f) {
-                    m_dragSlider = static_cast<int>(i);
-                    slideTo(sl, pp);
-                    return true;
-                }
-            }
-        }
-        auto p = m_mainLayer->convertToNodeSpace(touch->getLocation());
-        if (p.x >= 0.f && p.x <= W - 34.f && p.y >= H - TITLE && p.y <= H) {
-            m_dragging = true;
-            return true;
-        }
-        return Popup::ccTouchBegan(touch, event);
-    }
-
-    void ccTouchMoved(CCTouch* touch, CCEvent* event) override {
-        if (m_dragSlider >= 0 && m_page) {
-            slideTo(m_sliders[m_dragSlider], m_page->convertToNodeSpace(touch->getLocation()));
-            return;
-        }
-        if (!m_dragging) {
-            Popup::ccTouchMoved(touch, event);
-            return;
-        }
-        auto delta = touch->getLocation() - touch->getPreviousLocation();
-        m_mainLayer->setPosition(m_mainLayer->getPosition() + delta);
-        s_pos = m_mainLayer->getPosition();
-        s_moved = true;
-    }
-
-    void ccTouchEnded(CCTouch* touch, CCEvent* event) override {
-        if (m_dragSlider >= 0) {
-            int mode = m_sliders[m_dragSlider].mode;
-            m_dragSlider = -1;
-            saveModeTicks();
-            say("{}: {:g} frames", MODE_NAMES[mode], buf.modeTicks[mode] * TICK);
-            return;
-        }
-        if (m_dragging) {
-            m_dragging = false;
-            return;
-        }
-        Popup::ccTouchEnded(touch, event);
-    }
-
-    // ---------- actions ----------
-
-    void onCloseButton(CCObject*) {
-        keyBackClicked();
-    }
-
-    void onTab(CCObject* sender) {
-        s_tab = sender->getTag();
-        rebuildPage();
-    }
-
-    void onToggle(CCObject* sender) {
-        auto const& o = *m_options[sender->getTag()];
-        bool value = !optionValue(o);
-        if (o.key) {
-            Mod::get()->setSettingValue<bool>(o.key, value);
-            readSettings();
-            saveProfile();
-            refreshHeatmap();
-            refreshWatermark();
-            refreshAutoTag();
-        }
-        else {
-            buf.showPath = value;
-            if (buf.pathNode) {
-                buf.pathNode->clear();
-            }
-        }
-        say("{} {}", o.label, value ? "on" : "off");
-        refresh();
-    }
-
-    void perModeOff() {
-        if (buf.perMode) {
-            buf.perMode = false;
-            saveModeTicks();
-            say("per-mode frames off (stage picked)");
-        }
-    }
-
-    void onStage(CCObject* sender) {
-        perModeOff();
-        cycleStage(sender->getTag());
-        rebuildPage();
-    }
-
-    void onTps(CCObject* sender) {
-        int tps = static_cast<int>(Mod::get()->getSettingValue<int64_t>("tps"));
-        tps = std::clamp(tps + sender->getTag() * 20, TPS_MIN, TPS_MAX);
-        Mod::get()->setSettingValue<int64_t>("tps", tps);
-        refresh();
-    }
-
-    void onPerMode(CCObject*) {
-        buf.perMode = !buf.perMode;
-        saveModeTicks();
-        refreshWatermark();
-        refreshPanel();
-        say("per-mode frames {}", buf.perMode ? "on" : "off");
-        rebuildPage();
-    }
-
-    void onModeStep(CCObject* sender) {
-        int mode = sender->getTag() / 2;
-        int step = sender->getTag() % 2 ? 2 : -2;  // half a frame
-        buf.modeTicks[mode] = std::clamp(buf.modeTicks[mode] + step, 0, MODE_TICKS_MAX);
-        saveModeTicks();
-        say("{}: {:g} frames", MODE_NAMES[mode], buf.modeTicks[mode] * TICK);
-        refreshModes();
-    }
-
-    void onAllSettings(CCObject*) {
-        geode::openSettingsPopup(Mod::get());
-    }
-
-    void onCopyLog(CCObject*) {
-        exportConsole();
-    }
-
-    void onConsole(CCObject*) {
-        buf.panelOpen = !buf.panelOpen;
-        refreshPanel();
-        say("console {}", buf.panelOpen ? "shown" : "hidden");
-    }
-
-    // v2.75 presets: stage + the switches that matter most, in one click
-    void onPreset(CCObject* sender) {
-        auto* mod = Mod::get();
-        int which = sender->getTag();
-        int stage = which == 0 ? 2 : which == 1 ? 3 : 5;  // 2f / 4f / 8f
-        perModeOff();
-        mod->setSettingValue<bool>("robust-saves", true);
-        mod->setSettingValue<bool>("wave-safety-margin", which != 2);
-        mod->setSettingValue<bool>("more-time-death-spots", which != 0);
-        mod->setSettingValue<bool>("low-latency", false);
-        buf.stage = stage;
-        mod->setSavedValue("stage", buf.stage);
-        resetPending();
-        applyStage();
-        readSettings();
-        refreshWatermark();
-        refreshPanel();
-        say("preset: {} -> {}", which == 0 ? "Safe" : which == 1 ? "Balanced" : "Aggressive", stageText());
-        rebuildPage();
-    }
-
-    void onRunCheck(CCObject*) {
-        benchPending = true;
-        say("run check: runs at the start of your next attempt from the beginning (restart the level)");
-        FLAlertLayer::create("Run check",
-            "Restart the level from the beginning: your longest recorded run is replayed on the hidden player and the "
-            "result shows in the console (F9) and in Stats.",
-            "OK")->show();
-    }
-
-    void onStats(CCObject*) {
-        FLAlertLayer::create("Practice stats", statsText(), "OK")->show();
-    }
-
-    void onForget(CCObject*) {
-        memory.clear();
-        pending.active = false;
-        memoryDirty = true;
-        saveMemory();
-        refreshHeatmap();
-        say("memory for this level cleared");
-        refresh();
-    }
-
-protected:
-    bool init() {
-        if (!Popup::init(W, H, "GJ_square04.png")) {
-            return false;
-        }
-        m_bgSprite->setVisible(false);
-        if (m_closeBtn) {
-            m_closeBtn->setVisible(false);
-            m_closeBtn->setEnabled(false);
-        }
-        this->setOpacity(90);
-        if (s_moved) {
-            m_mainLayer->setPosition(s_pos);
-        }
-        s_open = this;
-        buildFrame();
-        rebuildPage();
-        this->scheduleUpdate();
-        return true;
-    }
-
-public:
-    ~BufferMenu() override {
-        if (s_open == this) {
-            s_open = nullptr;
-        }
-    }
-
-    static BufferMenu* create() {
-        auto* ret = new BufferMenu();
-        if (ret->init()) {
-            ret->autorelease();
-            return ret;
-        }
-        delete ret;
-        return nullptr;
-    }
-
-    // the menu key again closes it
-    static void open() {
-        if (s_open) {
-            s_open->keyBackClicked();
-            return;
-        }
-        if (auto* menu = create()) {
-            menu->show();
-        }
-    }
-};
-
-// v2.75.1: the level complete screen no longer shows "Click Before Frames was on" or the
-// saves count in the top right corner; the attempt is still finished here.
+// v2.46: end of a completed attempt. (The on-screen "was on" labels are gone; the bookkeeping stays.)
 class $modify(BufEndLevelLayer, EndLevelLayer) {
     void customSetup() {
         EndLevelLayer::customSetup();
+        if (!buf.usedThisAttempt) {
+            return;
+        }
+        if (buf.showComplete) {
+            auto win = CCDirector::get()->getWinSize();
+            auto* label = CCLabelBMFont::create("Testing was on", "bigFont.fnt");
+            label->setScale(0.35f);
+            label->setColor({ 150, 205, 255 });
+            label->setOpacity(170);
+            label->setAnchorPoint({ 1.f, 1.f });
+            label->setPosition({ win.width - 6.f, win.height - 4.f });
+            this->addChild(label, 100);
+            if (attemptStats.saves > 0) {
+                auto* stats = CCLabelBMFont::create(attemptSummary().c_str(), "bigFont.fnt");
+                stats->setScale(0.28f);
+                stats->setColor({ 255, 190, 225 });
+                stats->setOpacity(170);
+                stats->setAnchorPoint({ 1.f, 1.f });
+                stats->setPosition({ win.width - 6.f, win.height - 16.f });
+                this->addChild(stats, 100);
+            }
+        }
         benchFinish();  // a completed run is the best recording there is
         benchFlush();
         endAttempt();
     }
 };
 
-// v2.94: the pause menu has a button for the menu again (v2.92 had dropped it, so on phones,
-// with no menu key, there was no way to open it inside a level)
-class $modify(BufPauseLayer, PauseLayer) {
-    void customSetup() {
-        PauseLayer::customSetup();
-        auto* top = CCSprite::create("heart.png"_spr);
-        top->setScale(0.55f);
-        auto* sprite = CircleButtonSprite::create(top, CircleBaseColor::DarkPurple, CircleBaseSize::Medium);
-        auto* button = CCMenuItemSpriteExtra::create(sprite, this, menu_selector(BufPauseLayer::onBufferMenu));
-        button->setID("click-before-frames-button"_spr);
-        auto* menu = CCMenu::create();
-        menu->addChild(button);
-        auto win = CCDirector::get()->getWinSize();
-        menu->setPosition({ win.width - 40.f, 40.f });
-        menu->setID("click-before-frames-menu"_spr);
-        this->addChild(menu, 10);
-    }
+// v2.87 (rename): one-time COPY of the data of the old mod folder into this one. Nothing in the old
+// folder is changed or deleted. Runs once (import-done.txt), before config.json is loaded.
+// Returns the old stage mapped to the CURRENT numbering (v2.87.1) or -1. This is the only place that
+// still names the old folder.
+//
+// How the stage numberings chain (so nothing is shifted twice):
+//   old folder (very old numbering): 0..5 = 0.5f..8f, 6 = custom, 7 = off          (saved.json)
+//   v2.87.0 numbering (config.json, config-version 2): 0..5 presets, 6..9 custom A-D, 10 = off
+//   v2.87.1 numbering (config-version 3): 0 = 0.25f, 1..6 = 0.5f..8f, 7..10 custom A-D, 11 = off
+// Here the very old number goes straight to the v2.87.1 number, and the caller stores it with
+// config().set() AFTER config.init(), i.e. it never passes through the config-version migration
+// (which only reads a "stage" key inside a config.json of version 1 or 2).
+namespace {
+    constexpr char const* OLD_SAVE_FOLDER = "basu.input-buffer";
+    std::string importNote;
 
-    void onBufferMenu(CCObject*) {
-        BufferMenu::open();
+    int importOldData() {
+        namespace fs = std::filesystem;
+        std::error_code ec;
+        auto dir = Mod::get()->getSaveDir();
+        auto marker = dir / "import-done.txt";
+        if (fs::exists(marker, ec)) {
+            return -1;
+        }
+        auto old = dir.parent_path() / OLD_SAVE_FOLDER;
+        if (!fs::is_directory(old, ec)) {
+            return -1;
+        }
+        fs::create_directories(dir, ec);
+        int copied = 0;
+        for (char const* name : { "config.json", "run-check-results.txt" }) {
+            auto from = old / name;
+            if (fs::is_regular_file(from, ec)) {
+                std::error_code cec;
+                fs::copy_file(from, dir / name, fs::copy_options::skip_existing, cec);
+                copied += cec ? 0 : 1;
+            }
+        }
+        for (char const* name : { "memory", "bench" }) {
+            auto from = old / name;
+            if (fs::is_directory(from, ec)) {
+                std::error_code cec;
+                fs::copy(from, dir / name, fs::copy_options::skip_existing | fs::copy_options::recursive, cec);
+                copied += cec ? 0 : 1;
+            }
+        }
+        // saved.json: the old stage and the per-level profiles
+        int stage = -1;
+        int profiles = 0;
+        auto savedPath = old / "saved.json";
+        std::ifstream in(savedPath, std::ios::binary);
+        if (in) {
+            std::stringstream ss;
+            ss << in.rdbuf();
+            std::string text = ss.str();
+            auto sp = text.find("\"stage\"");
+            if (sp != std::string::npos) {
+                size_t i = sp + 7;
+                while (i < text.size() && (text[i] == ' ' || text[i] == ':' || text[i] == '\n' || text[i] == '\t')) {
+                    ++i;
+                }
+                if (i < text.size() && text[i] >= '0' && text[i] <= '9') {
+                    int old_stage = std::atoi(text.c_str() + i);
+                    // very old numbering -> v2.87.1: presets 0..5 -> 1..6, custom (6) -> custom A (7), off (7) -> off (11)
+                    stage = old_stage == 7 ? STAGE_OFF : (old_stage >= 0 && old_stage <= 5 ? old_stage + 1 : (old_stage == 6 ? FIRST_CUSTOM_STAGE : -1));
+                }
+            }
+            std::vector<std::string> keys;
+            for (size_t p = text.find("\"profile-"); p != std::string::npos; p = text.find("\"profile-", p + 1)) {
+                auto end = text.find('"', p + 1);
+                if (end == std::string::npos) {
+                    break;
+                }
+                auto key = text.substr(p + 1, end - p - 1);
+                if (key != "profile-globals" && std::find(keys.begin(), keys.end(), key) == keys.end()) {
+                    keys.push_back(key);
+                }
+            }
+            if (!keys.empty()) {
+                auto res = geode::utils::file::readJson(savedPath);
+                if (res.isOk()) {
+                    auto root = std::move(res).unwrap();
+                    for (auto const& key : keys) {
+                        if (root.contains(key.c_str())) {
+                            Mod::get()->setSavedValue(key, root[key.c_str()]);
+                            ++profiles;
+                        }
+                    }
+                }
+            }
+        }
+        std::ofstream(marker, std::ios::trunc) << "old data was copied once; delete this file to allow another import\n";
+        importNote = fmt::format("imported old data: {} item(s) copied, {} per-level profile(s), stage {}", copied, profiles,
+            stage >= 0 ? std::to_string(stage) + " (current numbering)" : std::string("none"));
+        return stage;
     }
-};
+}
 
 $on_mod(Loaded) {
-    buf.console = Mod::get()->getSettingValue<bool>("debug-console");
-    buf.showPath = Mod::get()->getSettingValue<bool>("show-path");
-    recoverGlobals();
-    // v2.58: low latency is switched on for everyone once (it can still be turned off), and
-    // the stage you picked last comes back, the same in every level.
-    if (!Mod::get()->getSavedValue<bool>("low-latency-v258", false)) {
-        Mod::get()->setSettingValue<bool>("low-latency", true);
-        Mod::get()->setSavedValue("low-latency-v258", true);
+    int importedStage = importOldData();
+    cfg::config().init(Mod::get()->getSaveDir());
+    if (importedStage >= 0) {
+        (void)cfg::config().set("stage", cfg::Val::number(importedStage));
     }
-    buf.stage = std::clamp(Mod::get()->getSavedValue<int>("stage", buf.stage), 0, STAGE_COUNT - 1);
-    // v2.62: per-level settings off (switched off once): every level uses the same switches
+    buf.showPath = cfg::b("show-path");
+    recoverGlobals();
+    buf.stage = std::clamp(static_cast<int>(cfg::i("stage")), 0, STAGE_COUNT - 1);
+    // v2.62: per-level settings off (switched off once): every level uses the same switches, like v2.43.1
     if (!Mod::get()->getSavedValue<bool>("per-level-v262", false)) {
-        Mod::get()->setSettingValue<bool>("per-level-settings", false);
+        cfg::setTemp("per-level-settings", false);
         Mod::get()->setSavedValue("per-level-v262", true);
+    }
+    // v2.60: low latency is off for every level (switched off once for existing installs too;
+    // it's one setting for all levels, not saved per level)
+    if (!Mod::get()->getSavedValue<bool>("low-latency-v260", false)) {
+        cfg::setTemp("low-latency", false);
+        Mod::get()->setSavedValue("low-latency-v260", true);
     }
     readSettings();
     applyStage();
 #ifdef GEODE_IS_WINDOWS
-    if (buf.console) {
-        AllocConsole();
+    // The live console is the only output: it opens with the game. Its close button is
+    // removed, because closing a console window would close Geometry Dash with it.
+    // (If the game already has a console, e.g. Geode's own, AllocConsole fails and the log
+    // simply goes to that one.)
+    if (AllocConsole()) {
         FILE* out = nullptr;
         freopen_s(&out, "CONOUT$", "w", stdout);
-        SetConsoleTitleA("Click Before Frames - Live Console");
+        SetConsoleTitleA("Testing - Live Console");
+        if (HWND window = GetConsoleWindow()) {
+            if (HMENU menu = GetSystemMenu(window, FALSE)) {
+                DeleteMenu(menu, SC_CLOSE, MF_BYCOMMAND);
+            }
+        }
     }
+    buf.console = true;
+    ConsoleSink::get().start();
 #endif
+    PipeServer::get().start();
     if (Loader::get()->isModLoaded("syzzi.click_between_frames")) {
         say("Click Between Frames detected: mid-tick sync {}", buf.cbfSync ? "on" : "off");
     }
     if (Loader::get()->isModLoaded("square3ang.cbfextrapolate")) {
-        say("CBF Extrapolate detected: visual only, predictions unaffected");
+        say("CBF Extrapolate detected: assumed to be visual only (not verified), predictions are not adjusted for it");
     }
-    say("v2.95.0 loaded. Stage key cycles: 0.5f -> 1f -> 2f -> 4f -> 6f -> 8f -> custom -> off");
+    say("v2.87.1 loaded. The stage key cycles: 0.25f -> 0.5f -> 1f -> 2f -> 4f -> 6f -> 8f -> custom A-D -> off");
+    if (!importNote.empty()) {
+        say("{}", importNote);
+    }
+    if (!cfg::config().loadNote().empty()) {
+        say("config: {}", cfg::config().loadNote());
+    }
 }
 
 class $modify(BufPlayLayer, PlayLayer) {
@@ -5780,6 +4404,7 @@ class $modify(BufPlayLayer, PlayLayer) {
         buf.appliedInput = false;
         buf.autoReleased = false;
         buf.autoClicked = false;
+        buf.swallowRelease = false;
         buf.rapid = 0;
         forgetPress();
         memoryDeath();
@@ -5810,122 +4435,15 @@ class $modify(BufPlayLayer, PlayLayer) {
         benchBestDirty = false;
         benchBestTicks = benchSavedTicks();
         loadProfile();
+        if (buf.saveDing) {
+            FMODAudioEngine::sharedEngine()->preloadEffect("counter003.ogg");  // v2.58: no hitch on the first ding
+        }
         buf.ghost1 = makeGhost(this);
         buf.ghost2 = makeGhost(this);
         buf.ghostLayerBase = buf.ghostLayer->getChildrenCount();
 
-        // In-game console (F9): hidden unless the player opens it.
-        constexpr float W = PANEL_W;
-        constexpr float H = PANEL_H;
         auto win = CCDirector::get()->getWinSize();
-        buf.panel = CCNode::create();
-        buf.panel->setPosition({ 8.f, win.height - H - 8.f });
-        buf.panel->setZOrder(1000);
-
-        // Background: the game's own blue background art, cropped to the panel and
-        // darkened from top to bottom so the text stays readable.
-        auto* stencil = CCLayerColor::create({ 255, 255, 255, 255 }, W, H);
-        auto* clip = CCClippingNode::create(stencil);
-        if (auto* art = CCSprite::create("game_bg_01_001.png")) {
-            auto size = art->getContentSize();
-            art->setScale(std::max(W / size.width, H / size.height));
-            art->setPosition({ W / 2.f, H / 2.f });
-            art->setColor({ 40, 120, 255 });
-            art->setOpacity(150);
-            clip->addChild(art);
-        }
-        auto* shade = CCLayerGradient::create({ 0, 0, 0, 50 }, { 0, 0, 0, 140 }, { 0.f, -1.f });
-        shade->setContentSize({ W, H });
-        clip->addChild(shade);
-        auto* header = CCLayerColor::create({ 0, 0, 0, 80 }, W, 28.f);
-        header->setPosition({ 0.f, H - 28.f });
-        clip->addChild(header);
-        auto* rule = CCLayerColor::create({ 255, 255, 255, 45 }, W - 16.f, 1.f);
-        rule->setPosition({ 8.f, H - 46.f });
-        clip->addChild(rule);
-        buf.panel->addChild(clip);
-
-        if (auto* frame = CCScale9Sprite::create("GJ_square07.png")) {
-            frame->setContentSize({ W, H });
-            frame->setPosition({ W / 2.f, H / 2.f });
-            frame->setOpacity(190);
-            buf.panel->addChild(frame);
-        }
-
-        auto* title = CCLabelBMFont::create("Click Before Frames", "goldFont.fnt");
-        title->setScale(0.55f);
-        title->setAnchorPoint({ 0.f, 0.5f });
-        title->setPosition({ 10.f, H - 14.f });
-        buf.panel->addChild(title);
-
-        auto* version = CCLabelBMFont::create(Mod::get()->getVersion().toVString().c_str(), "chatFont.fnt");
-        version->setScale(0.45f);
-        version->setOpacity(150);
-        version->setAnchorPoint({ 1.f, 0.5f });
-        version->setPosition({ W - 10.f, H - 14.f });
-        buf.panel->addChild(version);
-
-        buf.panelTitle = CCLabelBMFont::create("", "bigFont.fnt");
-        buf.panelTitle->setScale(0.4f);
-        buf.panelTitle->setAnchorPoint({ 0.f, 0.5f });
-        buf.panelTitle->setPosition({ 10.f, H - 37.f });
-        buf.panel->addChild(buf.panelTitle);
-
-        buf.panelLines.clear();
-        for (size_t i = 0; i < PANEL_LINES; ++i) {
-            auto* line = CCLabelBMFont::create("", "chatFont.fnt");
-            line->setScale(0.55f);
-            line->setAnchorPoint({ 0.f, 0.5f });
-            line->setPosition({ 10.f, H - 57.f - i * 13.f });
-            buf.panel->addChild(line);
-            buf.panelLines.push_back(line);
-        }
-
-        // v2.79: the hint shows the keys you set
-        auto* mod = Mod::get();
-        auto keyName = [mod](char const* key) {
-            auto binds = mod->getSettingValue<std::vector<Keybind>>(key);
-            return binds.empty() ? std::string("-") : binds.front().toString();
-        };
-        auto hintText = fmt::format("{} stage  {} menu  {} copy log  {} console  {} path  {} forget", keyName("bind-stage"),
-            keyName("bind-menu"), keyName("bind-export"), keyName("bind-console"), keyName("bind-path"), keyName("bind-forget"));
-        auto* hint = CCLabelBMFont::create(hintText.c_str(), "chatFont.fnt");
-        hint->setScale(0.45f);
-        hint->setColor({ 160, 190, 255 });
-        hint->setAnchorPoint({ 0.5f, 0.5f });
-        hint->setPosition({ W / 2.f, 9.f });
-        buf.panel->addChild(hint);
-
-        this->addChild(buf.panel);
-        refreshPanel();
-
-        // v2.95: the watermark is back (v2.92 had dropped it), shorter and smaller than before;
-        // on phones smaller still, so it doesn't sit on the touch controls
-#ifdef GEODE_IS_MOBILE
-        constexpr float WATERMARK_SCALE = 0.18f;
-#else
-        constexpr float WATERMARK_SCALE = 0.22f;
-#endif
-        buf.watermark = CCLabelBMFont::create("", "bigFont.fnt");
-        buf.watermark->setScale(WATERMARK_SCALE);
-        buf.watermark->setColor({ 150, 205, 255 });
-        buf.watermark->setOpacity(150);
-        buf.watermark->setAnchorPoint({ 0.f, 0.f });
-        buf.watermark->setPosition({ 4.f, 3.f });
-        buf.watermark->setZOrder(1000);
-        this->addChild(buf.watermark);
         buf.usedThisAttempt = false;
-        refreshWatermark();
-
-        buf.autoTag = CCLabelBMFont::create("AUTO INPUTS ON", "bigFont.fnt");
-        buf.autoTag->setScale(0.24f);
-        buf.autoTag->setColor({ 255, 120, 120 });
-        buf.autoTag->setOpacity(153);  // 60%, like the console; still readable in a recording
-        buf.autoTag->setAnchorPoint({ 1.f, 0.f });
-        buf.autoTag->setPosition({ win.width - 6.f, 4.f });
-        buf.autoTag->setZOrder(1000);
-        this->addChild(buf.autoTag);
-        refreshAutoTag();
 
         buf.hintLabel = CCLabelBMFont::create("", "bigFont.fnt");
         buf.hintLabel->setColor({ 255, 170, 215 });
@@ -5933,6 +4451,30 @@ class $modify(BufPlayLayer, PlayLayer) {
         buf.hintLabel->setPosition({ win.width / 2.f, win.height - 40.f });
         buf.hintLabel->setZOrder(1000);
         this->addChild(buf.hintLabel);
+
+        buf.autoTagLabel = CCLabelBMFont::create("AUTO INPUTS ON", "bigFont.fnt");
+        buf.autoTagLabel->setColor({ 255, 170, 60 });
+        buf.autoTagLabel->setOpacity(170);
+        buf.autoTagLabel->setScale(0.35f);
+        buf.autoTagLabel->setPosition({ win.width / 2.f, win.height - 12.f });
+        buf.autoTagLabel->setZOrder(1000);
+        this->addChild(buf.autoTagLabel);
+        buf.tpsLabel = CCLabelBMFont::create("TPS", "bigFont.fnt");
+        buf.tpsLabel->setOpacity(150);
+        buf.tpsLabel->setScale(0.3f);
+        buf.tpsLabel->setAnchorPoint({ 1.f, 0.f });
+        buf.tpsLabel->setPosition({ win.width - 6.f, 6.f });
+        buf.tpsLabel->setZOrder(1000);
+        this->addChild(buf.tpsLabel);
+        buf.watermarkLabel = CCLabelBMFont::create("", "bigFont.fnt");
+        buf.watermarkLabel->setScale(0.28f);
+        buf.watermarkLabel->setColor({ 150, 205, 255 });
+        buf.watermarkLabel->setOpacity(153);
+        buf.watermarkLabel->setAnchorPoint({ 0.f, 0.f });
+        buf.watermarkLabel->setPosition({ 6.f, 4.f });
+        buf.watermarkLabel->setZOrder(1000);
+        this->addChild(buf.watermarkLabel);
+        refreshOverlays();
 
         buf.heatNode = nullptr;
         if (m_progressBar) {
@@ -5952,6 +4494,7 @@ class $modify(BufPlayLayer, PlayLayer) {
         buf.isPlayer1 = true;
         buf.sinceInput = 999;
         buf.rapid = 0;
+        autoCooldownUntil = 0;
         forgetPress();
         buf.owner = this;
         return true;
@@ -5962,8 +4505,14 @@ class $modify(BufPlayLayer, PlayLayer) {
         benchFlush();
         benchRecording = false;
         saveMemory();
+        // v2.58: changes made in the settings popup during the level are kept for this level;
+        // before, leaving the level silently put the old values back.
+        saveProfile();
         restoreGlobals();
         buf.hintLabel = nullptr;
+        buf.autoTagLabel = nullptr;
+        buf.tpsLabel = nullptr;
+        buf.watermarkLabel = nullptr;
         buf.heatNode = nullptr;
         memoryKey.clear();
         dropGhosts();
@@ -5971,8 +4520,6 @@ class $modify(BufPlayLayer, PlayLayer) {
     }
 
     void resetLevel() {
-        triggerChecks.clear();  // v2.84
-        attemptStartTick = tickCount;  // v2.84.3
         benchFinish();
         benchNeedStart = true;
         endAttempt();
@@ -5990,25 +4537,27 @@ class $modify(BufPlayLayer, PlayLayer) {
         }
         resetPending();
         forgetPress();
-        refreshAutoTag();
         if (buf.pathNode) {
             buf.pathNode->clear();
         }
         buf.autoReleased = false;
         buf.autoClicked = false;
+        buf.swallowRelease = false;
         drift.active = false;
+        // v2.87.1 fix-restart-state (on by default): a manual restart used to carry things over
+        if (buf.fixRestart) {
+            pending.active = false;  // 1.1: an abandoned save is discarded: no credit, not a death
+            watched.clear();         // 1.3: the moving-object watch history belongs to the old attempt
+            movingNow.clear();
+            buf.sinceInput = 999;    // 1.8: spam timing starts fresh
+            buf.rapid = 0;
+        }
         PlayLayer::resetLevel();
         // v2.85: start every attempt from the game's own button state. A release you made while
         // your icon was dead never reached the mod, so it still thought you were holding and
         // pressed for you as the attempt started (the cube jumped by itself until you clicked).
         // Now the mod only presses when you press.
         syncHeld(this);
-    }
-
-    void togglePracticeMode(bool practiceMode) {
-        PlayLayer::togglePracticeMode(practiceMode);
-        refreshWatermark();
-        refreshAutoTag();
     }
 
     void playEndAnimationToPos(CCPoint position) {
@@ -6018,7 +4567,7 @@ class $modify(BufPlayLayer, PlayLayer) {
         PlayLayer::playEndAnimationToPos(position);
     }
 
-    // v2.78.3: the level's own circle effect (orb / pad hits) is never spawned by a ghost
+    // v2.79: the level's own circle effect (orb / pad hits) is never spawned by a ghost
     void spawnCircle() {
         if (buf.simulating) {
             return;
@@ -6057,32 +4606,15 @@ class $modify(BufEffectGameObject, EffectGameObject) {
         if (buf.simulating) {
             return;
         }
-        if (buf.predictTriggers) {
-            noteTriggerFire(layer, this);  // v2.84.2: any trigger with a target group, for the self-check
-        }
-        // v2.81: when a move (v2.83: or rotation) started, so a prediction can follow the rest of it
-        if ((m_objectID == 901 || m_objectID == 1346) && buf.predictTriggers && m_duration > 0.f && firedMoves.size() < 256) {
-            firedMoves[this] = tickCount;
-            startTriggerCheck(layer, this);  // v2.84
-        }
         EffectGameObject::triggerObject(layer, uniqueID, remapKeys);
     }
 
-    // v2.78.3: visual only, never from a ghost
+    // v2.79: visual only, never from a ghost
     void playTriggerEffect() {
         if (buf.simulating) {
             return;
         }
         EffectGameObject::playTriggerEffect();
-    }
-
-    // v2.84.6: a pad's own animation (it played when a ghost touched the pad, before you did:
-    // seen after gravity changes)
-    void animationTriggered() {
-        if (buf.simulating) {
-            return;
-        }
-        EffectGameObject::animationTriggered();
     }
 };
 
@@ -6098,7 +4630,7 @@ class $modify(BufGameObject, GameObject) {
         GameObject::playShineEffect();
     }
 
-    // v2.78.3: visual only, never from a ghost
+    // v2.79: visual only, never from a ghost
     void playDestroyObjectAnim(GJBaseGameLayer* layer) {
         if (buf.simulating) {
             return;
@@ -6107,7 +4639,7 @@ class $modify(BufGameObject, GameObject) {
     }
 };
 
-// v2.57: an orb the ghost uses while trying ticks played its "used" animation on the real
+// v2.79: an orb the ghost uses while trying ticks played its "used" animation on the real
 // level (seen on dash orbs before you reached them). The state is restored afterwards
 // anyway, so ghosts skip the visuals.
 class $modify(BufRingObject, RingObject) {
@@ -6130,7 +4662,6 @@ class $modify(BufRingObject, RingObject) {
         RingObject::spawnCircle();
     }
 
-    // v2.78.3: the activation call itself too (orbs and dash orbs still animated early)
     void triggerActivated(float xPosition) {
         if (buf.simulating) {
             return;
@@ -6159,16 +4690,9 @@ class $modify(BufPlayerObject, PlayerObject) {
         auto* layer = GameManager::get()->m_playLayer;
         if (layer && this == layer->m_player1) {
             ++tickCount;
-            if (!triggerChecks.empty()) {
-                runTriggerChecks(layer);  // v2.84
-            }
             ++logClock;
             if (buf.enabled) {
                 buf.usedThisAttempt = true;
-            }
-            if (buf.panelDirty) {
-                buf.panelDirty = false;
-                refreshPanel();
             }
             if (benchNeedStart) {
                 benchNeedStart = false;
@@ -6332,269 +4856,297 @@ class $modify(BufPlayerObject, PlayerObject) {
     }
 };
 
-// v2.81: Geode keybinds (mod settings or Geode's keybinds popup; work without F keys too).
-// Only act inside a level.
+// ---------- game-thread side of the external console ----------
+// Commands arrive from the pipe / hotkey threads already validated; they are applied here, on the
+// game thread, from the CCScheduler hook below (never from the pipe thread).
 namespace {
-    void keyAction(int action) {
+    std::string stripTags(std::string s) {
+        std::string o;
+        bool in = false;
+        for (char c : s) {
+            if (c == '<') { in = true; continue; }
+            if (c == '>' && in) { in = false; continue; }
+            if (!in) { o += c; }
+        }
+        return o;
+    }
+
+    // One call after any settings change: re-read everything and refresh what is drawn.
+    void onConfigChanged() {
+        // v2.87: the stage is a config key too ("set stage" from the console, "reset settings")
+        int wantStage = std::clamp(static_cast<int>(cfg::i("stage")), 0, STAGE_COUNT - 1);
+        if (wantStage != buf.stage) {
+            setStage(wantStage);
+        }
+        readSettings();
+        applyStage();
+        buf.showPath = cfg::b("show-path");
+        if (!buf.showPath && buf.pathNode) {
+            buf.pathNode->clear();
+        }
+        refreshHeatmap();
+        refreshOverlays();
+    }
+
+    void sendConfig() {
+        PipeServer::get().send(cfg::config().dump());
+    }
+
+    std::string buildState() {
         auto* layer = GameManager::get()->m_playLayer;
-        if (!layer) {
-            return;
+        auto const& st = sessionStats;
+        float dt = buf.tickLength > 0.001f ? buf.tickLength : TICK;
+        std::string warn;
+        if (buf.tps != 240) {
+            warn += "TPS is not 240: runs are not legit. ";
         }
-        switch (action) {
-            case 0:
-                cycleStage();
-                break;
-            case 1:
-                if (!layer->m_isPaused) {
-                    layer->pauseGame(true);
-                }
-                BufferMenu::open();
-                break;
-            case 2:
-                exportConsole();
-                break;
-            case 3:
-                buf.panelOpen = !buf.panelOpen;
-                refreshPanel();
-                break;
-            case 4:
-                buf.showPath = !buf.showPath;
-                if (buf.pathNode) {
-                    buf.pathNode->clear();
-                }
-                say("path view {}", buf.showPath ? "on" : "off");
-                break;
-            case 5:
-                memory.clear();
-                pending.active = false;
-                memoryDirty = true;
-                saveMemory();
-                say("memory for this level cleared");
-                break;
+        if (layer && buf.enabled && !layer->m_isPracticeMode && !buf.practiceOnly) {
+            warn += "Buffer is active outside practice mode (not for verified runs). ";
         }
+        std::string o = "{\"type\":\"state\"";
+        auto num = [&](char const* k, double v) { o += std::string(",\"") + k + "\":" + cfg::jnum(v); };
+        auto flag = [&](char const* k, bool v) { o += std::string(",\"") + k + "\":" + (v ? "true" : "false"); };
+        auto str = [&](char const* k, std::string const& v) { o += std::string(",\"") + k + "\":" + cfg::jstr(v); };
+        num("stage", buf.stage);
+        str("stageText", stageText());
+        flag("enabled", buf.enabled);
+        num("ticksAll", buf.ticksAll);
+        num("ticksWave", buf.ticksWave);
+        num("tps", buf.tps);
+        num("physicsPerSec", 60.0 / dt);
+        flag("inLevel", layer != nullptr);
+        str("level", layer && layer->m_level ? std::string(layer->m_level->m_levelName) : std::string());
+        flag("practice", layer && layer->m_isPracticeMode);
+        num("memorySpots", static_cast<double>(memorySpots()));
+        flag("lowLatency", buf.lowLatency);
+        flag("training", buf.train);
+        num("budgetMs", buf.budgetMs);
+        num("sessionSaves", static_cast<double>(st.saves));
+        num("sessionAttempts", static_cast<double>(st.attempts));
+        num("attemptSaves", static_cast<double>(attemptStats.saves));
+        num("avgEarlyTicks", st.saves > 0 ? static_cast<double>(st.earlySum) / st.saves : 0.0);
+        str("lastDecision", g_lastDecision);
+        str("lastCheck", lastBench);
+        num("droppedCmds", PipeServer::get().dropped());  // commands refused because the queue was full
+        str("warnings", warn);
+        return o + "}";
     }
 
-    void setupKeybinds() {
-        char const* binds[] = { "bind-stage", "bind-menu", "bind-export", "bind-console", "bind-path", "bind-forget" };
-        for (int i = 0; i < 6; ++i) {
-            listenForKeybindSettingPresses(binds[i], [i](Keybind const&, bool down, bool repeat, double) {
-                if (down && !repeat) {
-                    keyAction(i);
-                }
-                return false;
-            });
-        }
+    void sendHello() {
+        auto& p = PipeServer::get();
+        p.send("{\"type\":\"hello\",\"mod\":\"abhyu.input-buffer\",\"name\":\"Testing\",\"version\":" +
+            cfg::jstr(Mod::get()->getVersion().toVString()) + ",\"protocol\":1,\"note\":" + cfg::jstr(cfg::config().loadNote()) + "}");
+        p.send(cfg::config().schema());
+        sendConfig();
+        p.send(buildState());
     }
 
-    // v2.81 update check: once per game start, reads the version in the public repo's mod.json
-    // (in the background) and says so on the main menu if a newer one is out.
-    constexpr char const* REPO_URL = "https://github.com/raresdalas1009/-predictive-input-buffer";
-    std::string latestVersion;
-    bool updateChecked = false;
-    bool updateShown = false;
-
-    // v2.91 auto update: "Update now" downloads the .geode from the latest GitHub release and
-    // puts it in place of this one; the new version loads on the next start. The file is only
-    // installed if it really is this mod and a newer version than the one running.
-    constexpr bool INSTALL_UPDATES = true;
-    constexpr char const* RELEASE_API = "https://api.github.com/repos/raresdalas1009/-predictive-input-buffer/releases/latest";
-    bool updating = false;
-
-    Result<VersionInfo> packageVersion(ByteVector const& data) {
-        GEODE_UNWRAP_INTO(auto unzip, file::Unzip::create(ByteSpan(data)));
-        GEODE_UNWRAP_INTO(auto bytes, unzip.extract("mod.json"));
-        auto json = matjson::parse(std::string_view(reinterpret_cast<char const*>(bytes.data()), bytes.size()));
-        if (json.isErr()) {
-            return Err("the download has no readable mod.json");
-        }
-        auto info = json.unwrap();
-        if (info["id"].asString().unwrapOr("") != Mod::get()->getID()) {
-            return Err("the download is a different mod");
-        }
-        GEODE_UNWRAP_INTO(auto version, info["version"].asString());
-        return VersionInfo::parse(version);
+    // The presets the old Buffer menu had.
+    void applyPreset(std::string const& name) {
+        bool aggressive = name == "aggressive";
+        bool safe = name == "safe";
+        auto& c = cfg::config();
+        (void)c.set("robust-saves", cfg::Val::boolean(true));
+        (void)c.set("low-latency", cfg::Val::boolean(false));
+        (void)c.set("wave-safety-margin", cfg::Val::boolean(!aggressive));
+        (void)c.set("more-time-death-spots", cfg::Val::boolean(!safe));
+        // Safe = 2f, Balanced = 4f (wave 2f), Aggressive = 8f (the same windows as before the 0.25f stage existed)
+        setStage(safe ? STAGE_2F : aggressive ? STAGE_8F : STAGE_4F);  // resetPending, applyStage, readSettings
+        onConfigChanged();
+        say("preset {}: {}", name, stageText());
     }
 
-    void updateDone(bool ok, std::string message) {
-        updating = false;
-        say("update: {}", message);
-        if (!ok) {
-            createQuickPopup("Update failed", message + "\nYou can still get it from the GitHub page.", "OK", "Open page",
-                [](FLAlertLayer*, bool open) {
-                    if (open) {
-                        web::openLinkInBrowser(std::string(REPO_URL));
-                    }
-                });
-            return;
+    void runAction(std::string const& name) {
+        if (name == "stage") {
+            cycleStage(1);
         }
-        createQuickPopup("Updated!", message + "\nRestart the game to use it.", "Later", "Restart", [](FLAlertLayer*, bool restart) {
-            if (restart) {
-                game::restart(true);
-            }
-        });
-    }
-
-    void installUpdate() {
-        if (updating) {
-            return;
+        else if (name == "stage-back") {
+            cycleStage(-1);
         }
-        updating = true;
-        say("update: downloading...");
-        std::thread([] {
-            auto fail = [](std::string why) {
-                queueInMainThread([why] { updateDone(false, why); });
-            };
-            auto res = web::WebRequest()
-                .timeout(std::chrono::seconds(15))
-                .userAgent("ClickBeforeFrames")
-                .header("Accept", "application/vnd.github+json")
-                .getSync(RELEASE_API);
-            if (!res.ok()) {
-                return fail(fmt::format("Couldn't reach GitHub (error {}).", res.code()));
+        else if (name == "custom-up" || name == "custom-down") {
+            auto const& cs = STAGES[std::clamp(buf.stage, 0, STAGE_COUNT - 1)];
+            if (!cs.custom) {
+                say("custom up/down only works while a custom slot is the stage (now: {})", stageText());
             }
-            auto json = res.json();
-            if (json.isErr()) {
-                return fail("GitHub sent something unexpected.");
+            else {
+                int dir = name == "custom-up" ? 1 : -1;
+                int all = std::clamp(static_cast<int>(cfg::i(CUSTOM_TICKS_KEY[cs.slot])) + dir * 4, 1, cfg::CUSTOM_MAX_TICKS);
+                int wave = std::clamp(static_cast<int>(cfg::i(CUSTOM_WAVE_KEY[cs.slot])) + dir * 4, 0, cfg::CUSTOM_MAX_WAVE_TICKS);
+                (void)cfg::config().set(CUSTOM_TICKS_KEY[cs.slot], cfg::Val::number(all));
+                (void)cfg::config().set(CUSTOM_WAVE_KEY[cs.slot], cfg::Val::number(wave));
+                onConfigChanged();
+                say("{}", stageText());
             }
-            std::string url;
-            auto assets = json.unwrap()["assets"];
-            if (assets.isArray()) {
-                for (auto const& asset : assets) {
-                    auto name = asset["name"].asString().unwrapOr("");
-                    if (name.size() > 6 && name.ends_with(".geode")) {
-                        url = asset["browser_download_url"].asString().unwrapOr("");
-                        break;
-                    }
-                }
-            }
-            if (url.empty()) {
-                return fail("The latest release has no .geode file yet.");
-            }
-            auto file = web::WebRequest()
-                .timeout(std::chrono::seconds(120))
-                .userAgent("ClickBeforeFrames")
-                .followRedirects(true)
-                .getSync(url);
-            if (!file.ok()) {
-                return fail(fmt::format("The download failed (error {}).", file.code()));
-            }
-            auto data = std::move(file).data();
-            auto version = packageVersion(data);
-            if (version.isErr()) {
-                return fail("The downloaded file isn't a valid Click Before Frames build.");
-            }
-            auto newVersion = version.unwrap();
-            if (!(newVersion > Mod::get()->getVersion())) {
-                return fail(fmt::format("The newest download is {} and you already have {}: it isn't published yet.",
-                    newVersion.toVString(), Mod::get()->getVersion().toVString()));
-            }
-            auto written = file::writeBinarySafe(Mod::get()->getPackagePath(), ByteSpan(data));
-            if (written.isErr()) {
-                return fail("Couldn't write the new file into the mods folder.");
-            }
-            std::string done = fmt::format("Installed {}.", newVersion.toVString());
-            queueInMainThread([done] { updateDone(true, done); });
-        }).detach();
-    }
-
-    void showUpdatePopup() {
-        if (updateShown || latestVersion.empty() || !CCScene::get()) {
-            return;
         }
-        updateShown = true;
-        say("update: {} is out (you have {})", latestVersion, Mod::get()->getVersion().toVString());
-        createQuickPopup("Click Before Frames", fmt::format("<cp>{}</c> is out! You have {}.", latestVersion,
-            Mod::get()->getVersion().toVString()), "Later", INSTALL_UPDATES ? "Update now" : "Open page", [](FLAlertLayer*, bool yes) {
-                if (!yes) {
-                    return;
-                }
-                if (INSTALL_UPDATES) {
-                    installUpdate();
-                }
-                else {
-                    web::openLinkInBrowser(std::string(REPO_URL));
-                }
-            });
-    }
-
-    void checkForUpdate() {
-        if (updateChecked || !Mod::get()->getSettingValue<bool>("check-updates")) {
-            return;
+        else if (name.size() == 6 && name.rfind("slot-", 0) == 0 && name[5] >= 'a' && name[5] < 'a' + CUSTOM_SLOTS) {
+            setStage(FIRST_CUSTOM_STAGE + (name[5] - 'a'));
+            say("{}", stageText());
         }
-        updateChecked = true;
-        std::thread([] {
-            auto res = web::WebRequest()
-                .timeout(std::chrono::seconds(10))
-                .getSync("https://raw.githubusercontent.com/raresdalas1009/-predictive-input-buffer/main/mod.json");
-            if (!res.ok()) {
+        else if (name == "export") {
+            exportConsole();
+        }
+        else if (name == "run-check") {
+            benchPending = true;  // starts on the next attempt from the beginning
+            say("run check: will start on the next attempt from the beginning");
+        }
+        else if (name == "stats") {
+            std::string text = stripTags(statsText());
+            std::stringstream ss(text);
+            for (std::string line; std::getline(ss, line);) {
+                say("stats: {}", line);
+            }
+        }
+        else if (name == "path") {
+            (void)cfg::config().set("show-path", cfg::Val::boolean(!buf.showPath));
+            onConfigChanged();
+            say("path view {}", buf.showPath ? "on" : "off");
+        }
+        else if (name == "forget") {
+            if (!GameManager::get()->m_playLayer) {
+                say("forget: open a level first");
                 return;
             }
-            auto json = res.json();
-            if (json.isErr()) {
-                return;
+            memory.clear();
+            pending.active = false;
+            memoryDirty = true;
+            saveMemory();
+            say("memory for this level cleared");
+        }
+        else if (name.rfind("preset-", 0) == 0) {
+            applyPreset(name.substr(7));
+        }
+        else if (name.rfind("toggle:", 0) == 0) {
+            std::string key = name.substr(7);
+            bool now = !cfg::config().b(key);
+            if (cfg::config().set(key, cfg::Val::boolean(now)).empty()) {
+                onConfigChanged();
+                say("{} {}", key, now ? "on" : "off");
             }
-            auto version = json.unwrap()["version"].asString();
-            if (version.isErr()) {
-                return;
+        }
+        sendConfig();
+    }
+
+    void handleCmd(Cmd const& c) {
+        auto& p = PipeServer::get();
+        auto ack = [&](std::string const& err) {
+            std::string o = "{\"type\":\"ack\",\"cmd\":" + cfg::jstr(c.kind) + ",\"ok\":" + (err.empty() ? "true" : "false");
+            if (!c.key.empty()) {
+                o += ",\"key\":" + cfg::jstr(c.key);
             }
-            auto latest = VersionInfo::parse(version.unwrap());
-            if (latest.isErr() || !(latest.unwrap() > Mod::get()->getVersion())) {
-                return;
+            if (!err.empty()) {
+                o += ",\"error\":" + cfg::jstr(err);
             }
-            std::string name = latest.unwrap().toVString();
-            queueInMainThread([name] {
-                latestVersion = name;
-                auto* scene = CCScene::get();
-                if (scene && scene->getChildByID("MenuLayer")) {
-                    showUpdatePopup();
+            if (!c.id.empty()) {
+                o += ",\"id\":" + c.id;
+            }
+            p.send(o + "}");
+        };
+        if (c.kind == "hello") {
+            sendHello();
+        }
+        else if (c.kind == "get_config") {
+            sendConfig();
+        }
+        else if (c.kind == "set") {
+            // v2.87.1: config-version is internal; only the mod itself writes it
+            std::string err = c.key == "config-version" ? std::string("'config-version' is read-only") : cfg::config().set(c.key, c.value);
+            if (err.empty()) {
+                onConfigChanged();
+                say("setting {} = {}", c.key, cfg::jval(c.value));
+                sendConfig();
+            }
+            ack(err);
+        }
+        else if (c.kind == "stage") {
+            setStage(static_cast<int>(c.value.n));
+            ack("");
+        }
+        else if (c.kind == "preset") {
+            applyPreset(c.name);
+            sendConfig();
+            ack("");
+        }
+        else if (c.kind == "action") {
+            runAction(c.name);
+            ack("");
+        }
+        else if (c.kind == "reset") {
+            cfg::config().reset(c.name);
+            onConfigChanged();
+            say("settings reset ({})", c.name);
+            sendConfig();
+            ack("");
+        }
+    }
+
+    // Called every frame from the scheduler: two atomic reads when nobody is connected.
+    void pumpPipe(float dt) {
+        auto& p = PipeServer::get();
+        try {
+            if (auto note = p.takePipeNotice(); !note.empty()) {
+                say("{}", note);
+            }
+            // v2.87.1: a config.json save that failed is retried every few seconds; one note when it starts
+            // failing, one when it works again
+            static float saveAcc = 0.f;
+            saveAcc += dt;
+            if (saveAcc >= 5.f) {
+                saveAcc = 0.f;
+                if (auto note = cfg::config().pollSave(); !note.empty()) {
+                    say("config: {}", note);
                 }
-            });
-        }).detach();
+            }
+            if (p.takeHello()) {
+                sendHello();
+            }
+            if (p.hasCommands()) {
+                Cmd c;
+                for (int n = 0; n < 32 && p.pop(c); ++n) {
+                    handleCmd(c);
+                }
+            }
+            static float acc = 0.f;
+            acc += dt;
+            if (acc >= 0.25f) {
+                acc = 0.f;
+                if (p.connected()) {
+                    p.send(buildState());
+                }
+            }
+        }
+        catch (...) {
+        }
     }
 }
 
-$on_mod(Loaded) {
-    setupKeybinds();
-}
-
-// the main menu: a heart button that opens the menu (with the other buttons at the bottom),
-// and the update check
-class $modify(BufMenuLayer, MenuLayer) {
-    bool init() {
-        if (!MenuLayer::init()) {
-            return false;
-        }
-        auto* top = CCSprite::create("heart.png"_spr);
-        top->setScale(0.55f);
-        top->setColor({ 255, 255, 255 });
-        auto* sprite = CircleButtonSprite::create(top, CircleBaseColor::DarkPurple, CircleBaseSize::Medium);
-        auto* item = CCMenuItemSpriteExtra::create(sprite, this, menu_selector(BufMenuLayer::onBufferMenu));
-        item->setID("click-before-frames-button"_spr);
-        if (auto* bottom = this->getChildByID("bottom-menu")) {
-            bottom->addChild(item);
-            bottom->updateLayout();
-        }
-        checkForUpdate();
-        if (!latestVersion.empty() && !updateShown) {
-            queueInMainThread([] { showUpdatePopup(); });
-        }
-        return true;
-    }
-
-    void onBufferMenu(CCObject*) {
-        BufferMenu::open();
+class $modify(BufScheduler, CCScheduler) {
+    void update(float dt) {
+        pumpPipe(dt);
+        CCScheduler::update(dt);
     }
 };
 
-// v2.57 custom TPS: above 240 the level is stepped in 1/tps pieces. update() runs once per
-// step and getModifiedDelta() hands the step through unrounded, so each call is exactly one
-// physics step. (Below 240 the game's own step count would need patching, so 240 is the floor.)
+$on_mod(Loaded) {
+    std::string keys;
+    for (auto const& sp : cfg::specs()) {
+        if (cfg::isBind(sp.key) && !cfg::s(sp.key.c_str()).empty()) {
+            keys += (keys.empty() ? "" : " | ") + cfg::s(sp.key.c_str()) + " " + sp.key.substr(5);
+        }
+    }
+    say("keys (while Geometry Dash is focused): {}", keys);
+    say("settings file: {}", (Mod::get()->getSaveDir() / "config.json").string());
+}
+
+// v2.79 custom TPS (from the v2.80 build): above 240 the level is stepped in 1/tps pieces.
+// update() runs once per step and getModifiedDelta() hands the step through unrounded, so
+// each call is exactly one physics step. (Below 240 the game's own step count would need
+// patching, so 240 is the floor.) Runs at anything but 240 aren't legit completions.
 static bool tpsDriving = false;
 static double tpsCarry = 0.0;
 
 class $modify(BufBaseGameLayer, GJBaseGameLayer) {
     void update(float dt) {
-        int tps = static_cast<int>(Mod::get()->getSettingValue<int64_t>("tps"));
+        int tps = buf.tps;
         if (tps <= 240 || tpsDriving || !typeinfo_cast<PlayLayer*>(this)) {
             GJBaseGameLayer::update(dt);
             return;
@@ -6681,6 +5233,17 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
         uint64_t keep = buf.smart ? (COLLIDING_TYPES | INTERACT_TYPES) : COLLIDING_TYPES;
         bool haveRect = false;
         CCRect ghostRect;
+        // v2.87.1 fix-dual-harmless: P2's ghost has its own "already on you" set and its own start
+        // rectangle. Before, one set and "P1's OR P2's rectangle" served both ghosts, so a hazard on P2
+        // at the click was ignored for P1 (and a mode portal P1's ghost took was skipped for P2's).
+        bool ownSet = buf.fixDualHarmless && buf.ghost2 && player == buf.ghost2;
+        auto& harmless = ownSet ? buf.harmless2 : buf.harmless;
+        auto hitsStart = [&](CCRect const& r) {
+            if (buf.fixDualHarmless) {
+                return r.intersectsRect(ownSet ? buf.realRect2 : buf.realRect1);
+            }
+            return r.intersectsRect(buf.realRect1) || r.intersectsRect(buf.realRect2);
+        };
         auto& list = *objects;
         for (int i = 0; i < objectCount; ++i) {
             auto* object = list[i];
@@ -6700,13 +5263,13 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
                     continue;
                 }
                 if (buf.haveRealRect && (bit & HAZARD_TYPES)) {
-                    if (!buf.harmless.empty() && buf.harmless.contains(object)) {
+                    if (!harmless.empty() && harmless.contains(object)) {
                         continue;
                     }
                     if (buf.simTick <= 1) {
                         auto const& r = object->getObjectRect();
-                        if (r.intersectsRect(buf.realRect1) || r.intersectsRect(buf.realRect2)) {
-                            buf.harmless.insert(object);
+                        if (hitsStart(r)) {
+                            harmless.insert(object);
                             continue;
                         }
                     }
@@ -6732,26 +5295,23 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
             }
             if (ghostRect.intersectsRect(object->getObjectRect())) {
                 if (stop) {
-                    // v2.78.1: a mode portal you're still inside when you click was already taken
+                    // v2.79: a mode portal you're still inside when you click was already taken
                     // (you're in its mode now). It stopped every prediction at t0, so nothing right
                     // after a portal was predicted (Amethyst's first pink orb: the click was never
                     // moved onto the orb). Only portals ahead stop a prediction; teleport orbs
                     // still do, since they need a click.
-                    auto const& r = object->getObjectRect();
-                    if (buf.harmless.contains(object)) {
+                    if (harmless.contains(object)) {
                         continue;
                     }
-                    if (buf.haveStartRects && buf.simTick <= 1 && object->m_objectType != GameObjectType::TeleportOrb &&
-                        (r.intersectsRect(buf.realRect1) || r.intersectsRect(buf.realRect2))) {
-                        buf.harmless.insert(object);
+                    auto const& r = object->getObjectRect();
+                    if (buf.haveStartRects && buf.simTick <= 1 && object->m_objectType != GameObjectType::TeleportOrb && hitsStart(r)) {
+                        harmless.insert(object);
                         continue;
                     }
                     // v2.79: mode portals ahead are taken by the ghost (once per run)
-                    // v2.84: teleport and solo portals too
-                    if (buf.portalPredict && isGhost(player) &&
-                        (ghostTakePortal(player, object->m_objectType) || ghostTeleport(player, object) || ghostSoloPortal(object) ||
-                            ghostDualPortal(player, object))) {
-                        buf.harmless.insert(object);
+                    if (buf.portalPredict && buf.fullState && (MODE_TYPES & bit)) {
+                        setGhostMode(player, object->m_objectType);
+                        harmless.insert(object);
                         continue;
                     }
                     buf.ghostHitPortal = true;
@@ -6767,30 +5327,7 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
                 }
             }
         }
-        // v2.85: objects a predicted toggle switched on: the game leaves switched-off objects
-        // out, so the ones near the ghost are added (switched on just for this check)
-        static std::vector<GameObject*> woke;
-        woke.clear();
-        if (!buf.simEnabled.empty() && player) {
-            auto pos = player->getPosition();
-            for (auto* object : buf.simEnabled) {
-                auto type = static_cast<unsigned>(object->m_objectType);
-                uint64_t bit = type < 64 ? (1ull << type) : 0;
-                if (!(keep & bit) || buf.simDisabled.contains(object) || std::abs(object->m_positionX - pos.x) > 200.f ||
-                    std::abs(object->m_positionY - pos.y) > 200.f) {
-                    continue;
-                }
-                if (object->m_isGroupDisabled) {
-                    object->m_isGroupDisabled = false;
-                    woke.push_back(object);
-                }
-                relevant.push_back(object);
-            }
-        }
         GJBaseGameLayer::collisionCheckObjects(player, &relevant, static_cast<int>(relevant.size()), dt);
-        for (auto* object : woke) {
-            object->m_isGroupDisabled = true;
-        }
     }
 
     void handleButton(bool down, int button, bool isPlayer1) {
@@ -6888,9 +5425,21 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
         if (buf.simulating) {
             // v2.75: a toggle orb that switches a group off: the ghost stops colliding with
             // that group for the rest of this prediction (the real objects aren't touched)
-            // v2.85: and one that switches a group on, the ghost starts colliding with it
-            if (auto* objects = this->getGroup(group)) {
-                simToggle(objects, activate);
+            if (!activate) {
+                if (auto* objects = this->getGroup(group)) {
+                    for (auto* object : CCArrayExt<GameObject*>(objects)) {
+                        buf.simDisabled.insert(object);
+                    }
+                }
+            }
+            else if (buf.fixGroupOn) {
+                // v2.87.1 fix-group-on: switched back ON in this prediction: it collides again.
+                // (A group that was already off in the real level stays off: separate engine limit.)
+                if (auto* objects = this->getGroup(group)) {
+                    for (auto* object : CCArrayExt<GameObject*>(objects)) {
+                        buf.simDisabled.erase(object);
+                    }
+                }
             }
             return;
         }
@@ -6900,11 +5449,6 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
     void spawnGroup(int group, bool ordered, double delay, gd::vector<int> const& remapKeys, int triggerID, int controlID) {
         if (buf.simulating) {
             return;
-        }
-        // v2.85: a delayed spawn: what it sets off is predicted from when it will happen
-        if (buf.predictTriggers && delay > 0.0 && !ordered && remapKeys.empty() && group > 0 && pendingSpawns.size() < 64) {
-            float tickLength = buf.tickLength > 0.001f && buf.tickLength < 2.f ? buf.tickLength : TICK;
-            pendingSpawns.push_back({ group, tickCount + static_cast<int>(std::lround(delay * 60.0 / tickLength)) });
         }
         GJBaseGameLayer::spawnGroup(group, ordered, delay, remapKeys, triggerID, controlID);
     }
