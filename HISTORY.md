@@ -1,5 +1,17 @@
 # History
 
+## v2.88.0
+- `unlimited-delay` (off, key Ctrl+F4): no cap on how early an input may be. An early input is held back tick by tick until the first timing whose path survives, up to 24000 ticks (100 s). The stage then only matters as on / off. The search is still limited by the prediction time budget; while it is on, 'Auto time budget' no longer cuts the budget to one frame. The log / state text shows "unlimited". (A separate setting, not a new stage, so no stage number moved and config-version stays 3.)
+- `ship-uses-stage` (on): the ship may use the stage's delay (or unlimited) like every other mode, never less than `ship-max-delay`. Nothing changes below the 1f stage.
+- `orb-press-passthrough` (on): a press that already touches an orb goes to the game unchanged (never past a queued input), and orb alignment never re-times a press whose timing already activates the orb. This replaces the v2.26 re-timing of presses inside an orb while on; turn it off to get that back.
+- `orb-same-target` (on): orb alignment only counts a timing that activates the FIRST orb ahead, for the fully safe pick and for the fallback pick; a learned timing is tried only for that orb.
+- `inverted-wave` (on): upside-down wave uses a spam gap of at most 6 ticks, a minimum turn of 12 ticks, an escape of 24 ticks and a full-safety save target.
+- New `src/prediction_policy.hpp` (no Geode includes) holds these rules; `tests/prediction_policy_test.cpp` tests them and the GitHub build runs the tests.
+- Comment fix: the dash orb layer cleanup is labelled v2.87.2.
+
+## v2.87.2
+- Dash orb animation fix, ported from an older build of mine that was labelled v2.88 (not this version): anything a prediction (or the run check) adds to the real level's layers, such as the dash orb start effect, is removed again afterwards, so dash orbs no longer flash before you reach them. Visual cleanup only: no change to the prediction engine, hooks, settings or defaults.
+
 ## v2.87.1
 - New 0.25f stage (1 tick, wave 1 tick) in front of the ladder. Every stage number is one higher: 0 = 0.25f, 1 = 0.5f, 2 = 1f, 3 = 2f, 4 = 4f, 5 = 6f, 6 = 8f, 7-10 = custom A-D, 11 = off. A fresh install still starts on 0.5f; Safe / Balanced / Aggressive keep their windows (2f / 4f with 2f wave / 8f). config.json is version 3: a stage saved by version 1-2 is converted by meaning, and the import from the old mod folder lands on the same stage as before.
 - Fix toggles in config.json, off by default except the first: `fix-restart-state` (on: a manual restart drops the unscored level-memory outcome, the moving-object watch history and the spam timing), `fix-dual-harmless`, `fix-lowlat-queue`, `fix-practice-queue`, `fix-group-on`, `fix-orb-checks`, `fix-more-time-checks`, `fix-training-auto`, `fix-mover-conflict`, `fix-auto-throttle`.

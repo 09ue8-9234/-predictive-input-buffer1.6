@@ -1,4 +1,4 @@
-// Testing (id abhyu.input-buffer) v2.87.1: Click Before Frames engine, no in-game UI. All settings live in config.json (cfg.hpp) and are driven from an external console over a named pipe.
+// Testing (id abhyu.input-buffer) v2.88.0: Click Before Frames engine, no in-game UI. All settings live in config.json (cfg.hpp) and are driven from an external console over a named pipe.
 //
 // When you click (or release, in wave / robot), a hidden "ghost" player is simulated
 // ahead with your input. If the ghost dies, the input is retried with 1..N ticks of
@@ -33,6 +33,7 @@
 #include <Geode/modify/RingObject.hpp>
 #include <Geode/modify/CCScheduler.hpp>
 #include "cfg.hpp"
+#include "prediction_policy.hpp"
 #include <atomic>
 #ifdef GEODE_IS_WINDOWS
 #include <Windows.h>
@@ -333,6 +334,14 @@ namespace {
         bool orbAfterFirst = false;  // v2.78: orb alignment: once your click used an orb, click the later ones too
         bool laterOrbTouched = false;  // v2.78: the run reached another orb after the one your click used
         int orbUsedTick = -1;        // v2.6: first tick the current run actually used an orb
+        GameObject* firstOrb = nullptr;  // v2.88: first orb this ghost run touched (from BASU v2.84)
+        GameObject* usedOrb = nullptr;   // v2.88: first orb this ghost run actually activated
+        // v2.88 settings
+        bool unlimitedDelay = false;   // unlimited-delay
+        bool shipUsesStage = true;     // ship-uses-stage
+        bool orbPassThrough = true;    // orb-press-passthrough
+        bool orbSameTarget = true;     // orb-same-target
+        bool invertedWaveRules = true; // inverted-wave
         bool driftCheck = false;     // v2.4: log how far the real player strays from the prediction
         std::vector<CCPoint>* recordPath = nullptr;  // v2.4: ghost1 positions of the current run
         bool showPath = false;       // v2.11: draw the predicted path (F10)
@@ -941,6 +950,12 @@ namespace {
             buf.driftCheck = false;
         }
         buf.userBudget = buf.budgetMs;
+        // v2.88 settings
+        buf.unlimitedDelay = cfg::b("unlimited-delay");
+        buf.shipUsesStage = cfg::b("ship-uses-stage");
+        buf.orbPassThrough = cfg::b("orb-press-passthrough");
+        buf.orbSameTarget = cfg::b("orb-same-target");
+        buf.invertedWaveRules = cfg::b("inverted-wave");
         // v2.87.1 fix toggles
         buf.fixRestart = cfg::b("fix-restart-state");
         buf.fixDualHarmless = cfg::b("fix-dual-harmless");
@@ -973,7 +988,9 @@ namespace {
     // jump: only +1..+5 delays were ever tried, so most clicks got no save).
     void clickBudget() {
         double budget = buf.userBudget;
-        if (buf.autoBudget) {
+        // v2.88: with unlimited delay, scanning out to far-away saves takes more than a frame, so the
+        // auto cap (about one frame) doesn't apply; the budget setting is used as it is
+        if (buf.autoBudget && !buf.unlimitedDelay) {
             auto* director = CCDirector::get();
             double interval = director->getAnimationInterval() * 1000.0;
             double frame = director->getDeltaTime() * 1000.0;
@@ -1057,6 +1074,9 @@ namespace {
         }
         auto const& cs = STAGES[std::clamp(buf.stage, 0, STAGE_COUNT - 1)];
         std::string tag = cs.custom ? " (" + cfg::s(CUSTOM_NAME_KEY[cs.slot]) + ")" : std::string();
+        if (buf.unlimitedDelay) {
+            return fmt::format("Buffer{}: unlimited{}", tag, buf.train ? " [training]" : "");  // v2.88
+        }
         return fmt::format("Buffer{}: {:g}f / wave {:g}f{}", tag, buf.ticksAll * TICK,
             buf.ticksWave * TICK, buf.train ? " [training]" : "");
     }
@@ -1852,7 +1872,46 @@ namespace {
         buf.snapshots.push_back(s);
     }
 
+    // v2.87.2: anything a ghost added to the real level during a prediction (the dash start
+    // effect of dash orbs, bursts...) is removed afterwards. Dash orbs still flashed before
+    // you reached them: those effects go onto the level's layers, not the ghost's own.
+    struct NodeMark {
+        CCNode* node;
+        unsigned count;
+    };
+    std::vector<NodeMark> levelMarks;
+
+    void markLevelNodes(PlayLayer* layer) {
+        levelMarks.clear();
+        auto add = [](CCNode* n) {
+            if (n) {
+                levelMarks.push_back({ n, n->getChildrenCount() });
+            }
+        };
+        add(layer);
+        add(layer->m_objectLayer);
+        if (layer->m_aboveShaderObjectLayer != layer->m_objectLayer) {
+            add(layer->m_aboveShaderObjectLayer);
+        }
+        if (layer->m_objectLayer && layer->m_objectLayer->getChildren()) {
+            for (auto* child : CCArrayExt<CCNode*>(layer->m_objectLayer->getChildren())) {
+                add(child);
+            }
+        }
+    }
+
+    void sweepLevelNodes() {
+        for (auto const& m : levelMarks) {
+            auto* kids = m.node->getChildren();
+            while (kids && kids->count() > m.count) {
+                m.node->removeChild(static_cast<CCNode*>(kids->lastObject()), true);
+            }
+        }
+        levelMarks.clear();
+    }
+
     void restoreObjects() {
+        sweepLevelNodes();
         for (auto const& s : buf.snapshots) {
             s.object->m_isActivated = s.isActivated;
             if (s.effect) {
@@ -1946,12 +2005,15 @@ namespace {
             return horizon;
         }
         buf.simulating = true;
+        markLevelNodes(layer);
         buf.ghostDied = false;
         buf.ghostHitPortal = false;
         buf.firstOrbTick = -1;
         buf.lastOrbTick = -1;
         buf.laterOrbTouched = false;
         buf.orbUsedTick = -1;
+        buf.firstOrb = nullptr;
+        buf.usedOrb = nullptr;
 
         bool second = dual && buf.ghost2 && p2;
         buf.haveRealRect = buf.ignoreTouching;
@@ -2348,6 +2410,10 @@ namespace {
             }
         } reset;
 
+        // v2.88 orb-same-target: the first orb ahead (known after the probe below). A timing only counts as
+        // "used the orb" if it activated THIS orb, not one further along.
+        GameObject* targetOrb = nullptr;
+
         // one timing k: your click k ticks from now; later orbs clicked on touch, then 3 / 6 /
         // 10 ticks into them if that dies. Returns ticks survived and whether your click used an orb.
         auto tryAt = [&](int k, bool* used) {
@@ -2358,7 +2424,7 @@ namespace {
                 int ret = simulate(layer, p1, p2, dual, k, true, horizon, releaseAfter, horizon, &end);
                 buf.orbClickDelay = 0;
                 if (late == 0) {
-                    *used = buf.orbUsedTick >= 0;
+                    *used = prediction_policy::usesTargetOrb(buf.orbSameTarget, buf.orbUsedTick >= 0, targetOrb, buf.usedOrb);
                 }
                 best = std::max(best, ret);
                 if (ret >= horizon || buf.orbUsedTick < 0 || !buf.laterOrbTouched || !buf.orbTiming || end == SimEnd::StopSearch) {
@@ -2385,7 +2451,8 @@ namespace {
         };
 
         // the orb timing that worked at this spot on earlier runs is tried first
-        if (learned > 0 && learned <= maxDelay) {
+        // (v2.88 orb-same-target: only once the target orb is known, see below)
+        if (!buf.orbSameTarget && learned > 0 && learned <= maxDelay) {
             bool used;
             int ret = tryAt(learned, &used);
             if (used && ret >= horizon) {
@@ -2404,6 +2471,7 @@ namespace {
         buf.orbAfterFirst = true;
         int touch = buf.firstOrbTick;
         int leave = buf.lastOrbTick;
+        targetOrb = buf.firstOrb;  // v2.88
         std::string trace;  // v2.42: what was tried, for the explain log
         if (touch < 0 || touch > window) {
             return 0;
@@ -2411,8 +2479,18 @@ namespace {
 
         bool nowUsed;
         int now = tryAt(0, &nowUsed);
-        if (nowUsed && (now >= horizon || !buf.orbTiming)) {
+        // v2.88 orb-press-passthrough: a timing that already activates the orb is the player's own and is
+        // never re-timed, safe or not (BASU v2.84)
+        if (nowUsed && (now >= horizon || !buf.orbTiming || buf.orbPassThrough)) {
             return 0;  // pressing now uses the orb and is safe: nothing to fix
+        }
+        if (buf.orbSameTarget && learned > 0 && learned <= maxDelay) {
+            bool used;
+            int ret = tryAt(learned, &used);
+            if (used && ret >= horizon) {
+                *landed = ret;
+                return learned;
+            }
         }
         // every tick from just before the orb to the last tick inside it
         int from = nowUsed ? 1 : std::max(1, touch - 1);
@@ -2455,7 +2533,7 @@ namespace {
             // click: on ORBIT, clicking 9 ticks later lived 59 ticks after its click (crash at
             // t68) vs 50 for clicking now (t50), 18 ticks later, but 59 < 50 + 12 so it was
             // never picked
-            if (k + ret > bestAt) {
+            if (prediction_policy::orbFallbackBetter(buf.orbSameTarget, used, k + ret, bestAt)) {
                 bestAt = k + ret;
                 bestRet = ret;
                 bestK = k;
@@ -2534,12 +2612,17 @@ namespace {
         if (ret >= target || *end == SimEnd::StopSearch) {
             return ret;
         }
+        // v2.88 inverted-wave: upside-down corridors need quicker turns, so a hypothetical turn that is
+        // very early doesn't count, and the turn must survive longer (BASU v2.84)
+        bool invertedNow = prediction_policy::invertedWave(p1, p2, dual);
+        int minimumTurn = prediction_policy::waveMinimumTurn(buf.invertedWaveRules, invertedNow, st(WAVE_MIN_TURN), st(12));
+        int escape = prediction_policy::waveEscape(buf.invertedWaveRules, invertedNow, st(WAVE_ESCAPE), st(24));
         for (int margin : WAVE_TURN_MARGINS) {
             int turnAt = ret - st(margin);
-            if (turnAt < st(WAVE_MIN_TURN)) {
+            if (turnAt < minimumTurn) {
                 break;
             }
-            int length = std::min(horizon, turnAt + st(WAVE_ESCAPE));
+            int length = std::min(horizon, turnAt + escape);
             SimEnd turnEnd;
             int turned = simulateOrbs(layer, p1, p2, dual, delay, down, length, turnAt, length, &turnEnd);
             if (turned >= length) {
@@ -2775,7 +2858,7 @@ namespace {
         using clock = std::chrono::steady_clock;
         auto start = clock::now();
         double budget = searchBudget();
-        int target = std::min(horizon, base + st(12));
+        int target = prediction_policy::waveTarget(buf.invertedWaveRules, prediction_policy::invertedWave(p1, p2, dual), horizon, base, st(12));
         dbgBestK = 0;
         dbgBestRet = -1;
         for (int k = 1; k <= maxDelay; ++k) {
@@ -3033,6 +3116,7 @@ namespace {
             return;
         }
         buf.simulating = true;
+        markLevelNodes(layer);
         buf.ghostDied = false;
         buf.ghostHitPortal = false;
         buf.haveRealRect = false;
@@ -3455,6 +3539,21 @@ namespace {
             buf.releaseShift = 0;
         }
 
+        // v2.88 orb-press-passthrough: a real press while touching an orb is the player's own orb hit. It
+        // goes to the game unchanged, even if the prediction dislikes the path. Never past a delay that is
+        // still waiting: queued inputs keep their order. (BASU v2.84)
+        {
+            bool touchingOrb = (p1->m_touchingRings && p1->m_touchingRings->count() > 0) ||
+                (p2 && p2->m_touchingRings && p2->m_touchingRings->count() > 0);
+            if (prediction_policy::passOrbPress(buf.orbPassThrough, down, touchingOrb, buf.queue.empty())) {
+                buf.appliedInput = true;
+                if (buf.explain) {
+                    say("pass press: touching an orb (your own timing)");
+                }
+                return false;
+            }
+        }
+
         bool p1Wave = p1->m_isDart;
         bool anyWave = p1Wave || (p2 && p2->m_isDart);
         bool mini = (p1Wave && p1->m_vehicleSize < 1.f) || (p2 && p2->m_isDart && p2->m_vehicleSize < 1.f);
@@ -3467,6 +3566,10 @@ namespace {
         // v2.44: ship is steered by feathering, so it gets its own, much shorter spam gap;
         // otherwise nearly every ship input counted as spam and was never buffered.
         int spamGap = st(anyShip && !anyWave ? std::clamp(buf.shipSpamGap, 2, 40) : std::clamp(buf.spamGap, 4, 40));
+        if (anyWave) {
+            // v2.88 inverted-wave: tight upside-down zigzags stay buffered instead of counting as spam
+            spamGap = prediction_policy::waveSpamGap(buf.invertedWaveRules, spamGap, prediction_policy::invertedWave(p1, p2, dual), st(6));
+        }
         if (buf.sinceInput < spamGap) {
             ++buf.rapid;
         }
@@ -3563,7 +3666,9 @@ namespace {
         if (anyWave) {
             horizon = fullWaveHorizon(mini);
         }
-        int maxDelay = st(anyWave ? buf.ticksWave : (anyShip ? std::clamp(buf.shipMaxDelay, 0, 16) : buf.ticksAll));
+        // v2.88: unlimited-delay removes the stage's cap; ship-uses-stage lets the ship follow the stage
+        int maxDelay = st(prediction_policy::maxDelayTicks(anyWave, anyShip, buf.unlimitedDelay, buf.shipUsesStage,
+            buf.ticksAll, buf.ticksWave, buf.shipMaxDelay));
         if (buf.lowLatency) {
             maxDelay = std::min(maxDelay, st(4));  // at most 1 frame (60 fps) of delay
         }
@@ -3831,7 +3936,8 @@ namespace {
         // +32t..+40t "saves" that died ~130 ticks later, every time); those clicks now go
         // through untouched instead of being moved by up to 10 frames for nothing.
         // v2.75: robot jumps and UFO / swing flaps too (no more half saves there either)
-        int needed = (groundPress || robotPress || ufoPress) ? horizon : std::min(horizon, base + st(12));
+        int needed = (groundPress || robotPress || ufoPress) ? horizon
+            : prediction_policy::waveTarget(buf.invertedWaveRules, cubeStyleWave && prediction_policy::invertedWave(p1, p2, dual), horizon, base, st(12));
         int learned = memoryDelay(slice);
         if (learned > 0 && learned <= maxDelay && !(anyWave && buf.waveV46)) {
             int target = needed;
@@ -4837,6 +4943,7 @@ class $modify(BufPlayerObject, PlayerObject) {
                 buf.orbsUsed.insert(ring);
                 if (buf.orbUsedTick < 0) {
                     buf.orbUsedTick = buf.simTick;
+                    buf.usedOrb = ring;
                 }
             }
             return;
@@ -4850,6 +4957,7 @@ class $modify(BufPlayerObject, PlayerObject) {
             buf.orbsUsed.insert(ring);
             if (buf.orbUsedTick < 0) {
                 buf.orbUsedTick = buf.simTick;
+                buf.usedOrb = ring;
             }
         }
         PlayerObject::startDashing(ring);
@@ -5369,6 +5477,7 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
             buf.touchedOrb = true;
             if (buf.firstOrbTick < 0) {
                 buf.firstOrbTick = buf.simTick;
+                buf.firstOrb = ring;
             }
             buf.lastOrbTick = buf.simTick;
             if (buf.orbUsedTick >= 0 && !buf.orbsUsed.contains(ring)) {
