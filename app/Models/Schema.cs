@@ -42,11 +42,33 @@ public sealed class SchemaDoc
     public string ModVersion { get; private set; } = "";
     public string Origin { get; private set; } = "";
 
-    // changes when any setting, limit or default changes (used to compare with the running game's schema)
+    // 1.0.1: covers the whole parsed schema (settings with their text, actions, stages, slots, presets, per-level keys
+    // and limits), so a changed description or stage table also counts. ModVersion and Origin are left out on purpose:
+    // a version-only difference doesn't rebuild the UI. Used to compare with the running game's schema.
     public string Signature()
     {
+        var inv = System.Globalization.CultureInfo.InvariantCulture;
         var sb = new System.Text.StringBuilder();
-        foreach (var s in Settings) sb.Append(s.Key).Append('|').Append(s.Kind).Append('|').Append(s.Default).Append('|').Append(s.Min).Append('|').Append(s.Max).Append(';');
+        void F(object? v) => sb.Append(Convert.ToString(v, inv)?.Replace("\\", "\\\\").Replace("|", "\\|")).Append('|');
+        sb.Append("settings|");
+        foreach (var s in Settings) { F(s.Key); F(s.Kind); F(s.Default); F(s.Min); F(s.Max); F(s.Info); sb.Append(';'); }
+        sb.Append("actions|");
+        foreach (var a in Actions) { F(a.Name); F(a.Info); sb.Append(';'); }
+        sb.Append("stages|");
+        foreach (var st in Stages) { F(st.Stage); F(st.Enabled); F(st.Ticks); F(st.WaveTicks); F(st.Custom); F(st.Slot); sb.Append(';'); }
+        sb.Append("slots|");
+        foreach (var sl in Slots) { F(sl.Slot); F(sl.Letter); F(sl.Stage); F(sl.TicksKey); F(sl.WaveKey); F(sl.NameKey); sb.Append(';'); }
+        sb.Append("presets|");
+        foreach (var p in Presets)
+        {
+            F(p.Name); F(p.Stage); F(p.Info);
+            foreach (var kv in p.Set.OrderBy(k => k.Key, StringComparer.Ordinal)) { F(kv.Key); F(kv.Value); }
+            sb.Append(';');
+        }
+        sb.Append("perLevel|");
+        foreach (var k in PerLevel.OrderBy(k => k, StringComparer.Ordinal)) F(k);
+        sb.Append("limits|");
+        F(ConfigVersion); F(StageMax); F(CustomMaxTicks); F(CustomMaxWaveTicks);
         return sb.ToString();
     }
 

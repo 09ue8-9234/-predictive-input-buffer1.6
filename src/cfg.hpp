@@ -11,6 +11,7 @@
 #include <fstream>
 #include <map>
 #include <mutex>
+#include <set>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -342,7 +343,6 @@ namespace cfg {
         if (setting == "performance-mode") return "Shift+F7";
         if (setting == "training-mode") return "F9";
         if (setting == "wave-auto-release") return "Shift+F9";
-        if (setting == "practice-only") return "Shift+F10";
         if (setting == "death-heatmap") return "Shift+F11";
         if (setting == "save-ding") return "Shift+F12";
         if (setting == "show-hint-text") return "Ctrl+F6";
@@ -376,12 +376,11 @@ namespace cfg {
         {"sim-budget-ms", Kind::Float, 8.0, 1.0, 30.0, "", R"~(Prediction time budget (ms): Max time spent predicting per click. Higher = finds longer saves on big windows, but may hitch on dense levels.)~"},
         {"smart-prediction", Kind::Bool, 1, 0, 0, "", R"~(Orb / pad / portal prediction: Let the ghost use orbs, pads, gravity portals and speed portals. Turn off if you see glitches with objects.)~"},
         {"ground-horizon", Kind::Int, 130, 48, 240, "", R"~(Cube / ball lookahead (ticks): How far ahead the prediction looks for cube, ball and spider. A cube jump lasts about 100 ticks, so the old 48 never saw the landing. Higher = catches later hits but costs more time per click.)~"},
-        {"practice-only", Kind::Bool, 0, 0, 0, "", R"~(Practice mode only: ON: only buffer inputs in practice mode. OFF: buffer in every run.)~"},
         {"wave-horizon", Kind::Int, 65, 20, 160, "", R"~(Wave lookahead (ticks): How far ahead the wave prediction looks (mini wave uses 15 ticks less). 65 = 65 normal / 50 mini. Longer sees crashes further away but costs more time per click.)~"},
         {"orb-assume-hit", Kind::Bool, 1, 0, 0, "", R"~(Orbs: assume you click them (calculation mode): The prediction clicks every orb it touches, as if you hit it on time. Turn off if it predicts deaths for orbs you normally skip.)~"},
         {"orb-try-both", Kind::Bool, 1, 0, 0, "", R"~(Orbs: also try the other choice: If a prediction touches an orb and dies, run it again with the opposite orb choice (click / skip) and keep the better one, like a player who only clicks the orb when needed.)~"},
         {"avoid-moving-objects", Kind::Bool, 0, 0, 0, "", R"~(Don't buffer near moving objects: Experimental. The prediction sees the level frozen at your click. If the ghost's path touches spikes or blocks that moved recently (move/rotate triggers), the input goes through untouched instead of being delayed. Can cancel good saves on levels with lots of movement. Don't use it together with 'Predict moving objects': with 'Fix: movers conflict' on, predict wins and this one is ignored.)~"},
-        {"wave-auto-release", Kind::Bool, 0, 0, 0, "", R"~(Wave auto-release: While you hold in wave, if holding would crash within the window below and letting go clearly survives, the mod lets go for you. Your own release is then ignored. Practice mode only, unless 'Auto-release in normal runs' is on.)~"},
+        {"wave-auto-release", Kind::Bool, 0, 0, 0, "", R"~(Wave auto-release: While you hold in wave, if holding would crash within the window below and letting go clearly survives, the mod lets go for you. Your own release is then ignored.)~"},
         {"auto-release-window", Kind::Int, 6, 2, 24, "", R"~(Auto-release window (ticks): Auto-release only fires when holding would crash within this many ticks. Small = lets go at the last moment. 4 ticks = 1 frame at 60fps.)~"},
         {"drift-check", Kind::Bool, 0, 0, 0, "", R"~(Drift check (debug): After each input, compare where the prediction said you'd go with where you actually went, and log the biggest gap in the live console. Use it to see how precise the predictions are on a level.)~"},
         {"wave-spam-gap", Kind::Int, 16, 4, 40, "", R"~(Wave spam: max gap (ticks): Presses/releases closer together than this count as spam. After 'Spam: inputs in a row' of them, wave inputs go straight to the game until you pause. 16 ticks = 4 frames at 60fps (about 7 clicks/sec). Raise it if spam still gets buffered, lower it if tight wave parts stop being buffered.)~"},
@@ -394,13 +393,12 @@ namespace cfg {
         {"orb-align-ground", Kind::Bool, 0, 0, 0, "", R"~(Orb alignment: also from the ground: Off: presses made while standing on the ground are normal jumps and never get moved onto an orb. On: a ground jump made just before an orb can be turned into an orb hit.)~"},
         {"full-ghost-state", Kind::Bool, 1, 0, 0, "", R"~(Full ghost state (v2.8): Copy the full player state (slopes, timers, forces, dash...) into the prediction ghost. Turn off to go back to the v2.7 ghost if predictions feel worse.)~"},
         {"robot-smart", Kind::Bool, 1, 0, 0, "", R"~(Robot: smart jumps: A robot press only counts as a crash if no hold length saves it (your usual hold, then short to long holds). Saves are found for presses that need a different jump height, and presses you can still control aren't delayed.)~"},
-        {"robot-auto-release", Kind::Bool, 0, 0, 0, "", R"~(Robot auto-release: While you hold a robot jump, if holding longer would crash within the auto-release window and letting go survives, the mod lets go for you. Your own release is then ignored. Practice mode only, unless 'Auto-release in normal runs' is on.)~"},
+        {"robot-auto-release", Kind::Bool, 0, 0, 0, "", R"~(Robot auto-release: While you hold a robot jump, if holding longer would crash within the auto-release window and letting go survives, the mod lets go for you. Your own release is then ignored.)~"},
         {"level-memory", Kind::Bool, 1, 0, 0, "", R"~(Level memory (learns from your runs): Remembers, per level and per spot, which delays worked, where saves ended in deaths and where you keep dying. Delays that worked before are tried first; spots where saves keep failing are left alone; orange dots in the path view mark spots where you die a lot. F11 forgets the current level.)~"},
-        {"auto-click", Kind::Bool, 0, 0, 0, "", R"~(Auto-click: When you're not holding and doing nothing would crash within the auto-release window, but a click right now (with your usual hold) is fully safe, the mod clicks for you. Your own click, if it still comes, is ignored. Cube, ball, UFO, robot, spider and swing (not wave / ship). Practice mode only, unless 'Auto-release in normal runs' is on; then AUTO INPUTS ON shows on screen. Runs with this aren't legit.)~"},
+        {"auto-click", Kind::Bool, 0, 0, 0, "", R"~(Auto-click: When you're not holding and doing nothing would crash within the auto-release window, but a click right now (with your usual hold) is fully safe, the mod clicks for you. Your own click, if it still comes, is ignored. Cube, ball, UFO, robot, spider and swing (not wave / ship).)~"},
         {"predict-through-portals", Kind::Bool, 1, 0, 0, "", R"~(Predict through portals: Predictions keep going through mode portals (cube, ship, ball, UFO, wave, robot, spider, swing): the hidden ghost switches mode there instead of the prediction stopping. Dual, solo and teleport portals still stop it. Needs 'Full ghost state' on.)~"},
-        {"auto-release-normal-runs", Kind::Bool, 0, 0, 0, "", R"~(Auto-release in normal runs: Let auto-release (wave / robot / dash) and auto-click also work outside practice mode. While it can act, an 'AUTO INPUTS ON' tag is shown on screen. Never use it for verified or leaderboard runs.)~"},
         {"spider-smart", Kind::Bool, 1, 0, 0, "", R"~(Spider: smart flips: A spider flip counts as done once you stand on the new surface for 12 ticks, and a crash you could have avoided by flipping back counts as safe. Stops the spider from delaying flips because of obstacles that need your next click.)~"},
-        {"dash-auto-release", Kind::Bool, 0, 0, 0, "", R"~(Dash orb auto-release: While you hold a dash, if holding longer would crash within the auto-release window and letting go survives, the mod lets go for you (your own release is then ignored). Practice mode only, unless 'Auto-release in normal runs' is on.)~"},
+        {"dash-auto-release", Kind::Bool, 0, 0, 0, "", R"~(Dash orb auto-release: While you hold a dash, if holding longer would crash within the auto-release window and letting go survives, the mod lets go for you (your own release is then ignored).)~"},
         {"perf-log", Kind::Bool, 0, 0, 0, "", R"~(Performance log (debug): After each click, log in the live console how long its predictions took, how many runs and ghost ticks it used, and the cost per ghost tick. Changes nothing about the decisions.)~"},
         {"ship-buffer", Kind::Bool, 1, 0, 0, "", R"~(Ship: buffer inputs: Buffer ship presses and releases. A crash only counts if you couldn't have recovered (the opposite input 8 / 16 / 24 ticks before it is tried), the smallest delay that clears wins, and only very fast taps go straight through (ship spam gap). Off = ship is never touched.)~"},
         {"ship-max-delay", Kind::Int, 4, 0, 16, "", R"~(Ship: max delay (ticks): Ship's own max delay, used instead of the F6 stage (unless 'Ship: use the stage's delay' lets it follow the stage). Ship has momentum, so small delays are enough and big ones feel laggy. 4 ticks = 1 frame at 60fps.)~"},
@@ -424,16 +422,15 @@ namespace cfg {
         {"save-ding", Kind::Bool, 0, 0, 0, "", R"~(Save ding (in-game sound, off by default). Plays a short sound when a click is saved.)~"},
         {"performance-mode", Kind::Bool, 0, 0, 0, "", R"~(Performance mode: For PCs that drop frames when you click: predictions get at most 4 ms per click, robust saves are off (no extra robustness checks), orbs are only tried with a normal click (no late-click retries), and the drift check and the between-clicks live path view are off. If Path view is on, the path of each click's decision is still drawn after it (two extra predictions per click); performance mode doesn't change that. Saves can be a little less precise.)~"},
         {"auto-budget", Kind::Bool, 1, 0, 0, "", R"~(Auto time budget: While the game is already dropping frames (a frame took over twice as long as it should, and over 20 ms), clicks get at most 4 ms of prediction time so it doesn't get worse. Otherwise the time budget setting is used as it is.)~"},
-        {"tps", Kind::Int, 240, 240, 1000, "", R"~(Physics TPS: Physics steps per second in levels. 240 is the normal game. Higher values change the physics, so runs at anything but 240 aren't legit completions. The buffer's windows scale with it automatically.)~"},
+        {"tps", Kind::Int, 240, 240, 1000, "", R"~(Physics TPS: Physics steps per second in levels. 240 is the normal game. Higher values change the physics. The buffer's windows scale with it automatically.)~"},
         {"show-hint-text", Kind::Bool, 0, 0, 0, "", R"~(Training hint text (in-game text, off by default). Shows "click 2f early" at the top of the screen in training mode.)~"},
-        {"show-auto-tag", Kind::Bool, 0, 0, 0, "", R"~(AUTO INPUTS ON tag (in-game text, off by default). Small label while any auto-release or auto-click option is on. It also appears by itself, even with this off, whenever 'Auto-release in normal runs' is on and an auto option is on (display only).)~"},
-        {"show-tps-text", Kind::Bool, 0, 0, 0, "", R"~(TPS text (in-game text, off by default). Small label with the physics TPS (anything but 240 is not a legit run).)~"},
+        {"show-auto-tag", Kind::Bool, 0, 0, 0, "", R"~(AUTO INPUTS ON tag (in-game text, off by default). Small label while any auto-release or auto-click option is on.)~"},
+        {"show-tps-text", Kind::Bool, 0, 0, 0, "", R"~(TPS text (in-game text, off by default). Small label with the physics TPS.)~"},
         {"show-watermark", Kind::Bool, 0, 0, 0, "", R"~(Watermark (in-game text, off by default). Small "Testing | stage" label in the corner of the level while the buffer is on.)~"},
         {"show-complete-label", Kind::Bool, 0, 0, 0, "", R"~(Level complete label (in-game text, off by default). Shows "Testing was on" and the attempt's save summary on the level complete screen if the buffer was on during the attempt.)~"},
         {"fix-restart-state", Kind::Bool, 1, 0, 0, "", R"~(Fix: clean restart state: On a manual restart (R, checkpoint, practice) the mod drops the level-memory outcome that was still waiting to be scored (no credit, no death), forgets the watched moving objects and resets the spam timing. Off = the v2.87.0 behaviour. On by default.)~"},
         {"fix-dual-harmless", Kind::Bool, 0, 0, 0, "", R"~(Fix: dual-mode touching hazards: In dual mode each player's prediction ignores only the hazards that overlap that player at the click (before, a hazard on P2 was ignored for P1 too, and the other way round). Off by default.)~"},
         {"fix-lowlat-queue", Kind::Bool, 0, 0, 0, "", R"~(Fix: low latency queue: In low latency mode a new press that comes in behind a queued release now fires one tick after it, instead of in the same update (which gave a zero-length release). Off by default.)~"},
-        {"fix-practice-queue", Kind::Bool, 0, 0, 0, "", R"~(Fix: drop the queue outside practice: With 'Practice mode only' on, a delayed input that is still waiting when practice mode ends (or the setting is switched on) is dropped and the game gets your real button state. Off by default.)~"},
         {"fix-group-on", Kind::Bool, 0, 0, 0, "", R"~(Fix: toggle orb switching a group on: When a toggle orb in a prediction switches a group back on, the ghost collides with it again (before, only switching off was remembered). Off by default.)~"},
         {"fix-orb-checks", Kind::Bool, 0, 0, 0, "", R"~(Fix: safety checks for orb alignment: Orb alignment saves also get the moving-object check ('Don't buffer near moving objects') and the robust check on the fallback pick (the timing that only crashes latest). Off by default.)~"},
         {"fix-more-time-checks", Kind::Bool, 0, 0, 0, "", R"~(Fix: safety checks for MORE TIME: The 'More time at spots you keep dying' delay also gets the moving-object check, and the robust check when it removes the crash completely. Off by default.)~"},
@@ -493,6 +490,7 @@ namespace cfg {
                 ok = loadFile(m_dir / "config.bak.json", false);
                 if (!ok) defaults();
                 m_loadNote = std::string(ok ? "config.json was unreadable, restored the last valid copy" : "no valid config found, defaults used") + kept;
+                if (ok && !m_bindNote.empty()) m_loadNote += "; " + m_bindNote;  // v2.88.4
             }
             m_vals["config-version"] = Val::number(CONFIG_VERSION);
             saveLocked();
@@ -612,7 +610,7 @@ namespace cfg {
         }
         void defaults() { m_vals.clear(); for (auto const& sp : specs()) m_vals[sp.key] = defaultOf(sp); }
 
-        std::string validateLocked(std::string const& key, Val& v) const {
+        std::string validateLocked(std::string const& key, Val& v, bool checkCollisions = true) const {
             auto const* sp = findSpec(key);
             if (!sp) return "unknown setting '" + key + "'";
             switch (sp->kind) {
@@ -646,6 +644,7 @@ namespace cfg {
                     int vk = 0, mods = 0;
                     if (!parseKey(v.s, vk, mods)) return "'" + v.s + "' is not a valid key (examples: F8, Shift+F6, Ctrl+F1)";
                     v.s = keyName(vk, mods);
+                    if (!checkCollisions) return "";  // v2.88.4: loadFile checks collisions after every binding is read
                     for (auto const& [k, other] : m_vals) {
                         if (k != key && isBind(k) && other.t == Val::Str && other.s == v.s) return "'" + v.s + "' is already used by " + k.substr(5);
                     }
@@ -675,6 +674,8 @@ namespace cfg {
                     ? "config.json is from a newer version (settings this version doesn't know were ignored; a copy was kept)"
                     : "config.json was upgraded from an older version (a copy was kept)";
             }
+            m_bindNote.clear();
+            std::set<std::string> fileBinds;  // v2.88.4: bindings that config.json set (and that are valid keys)
             for (auto const& sp : specs()) {
                 auto it = o.find(sp.key);
                 if (it == o.end()) continue;
@@ -686,13 +687,66 @@ namespace cfg {
                     if (v.t != Val::Num || v.n < 0 || v.n > 10 || std::fabs(v.n - std::round(v.n)) > 1e-9) continue;
                     v.n = std::round(v.n) + 1;
                 }
-                if (validateLocked(sp.key, v).empty()) m_vals[sp.key] = v;  // bad or conflicting values keep the default
+                // v2.88.4: bindings are only syntax-checked here (bad text keeps the default); collisions are
+                // resolved below once every binding is read, so a swap like stage=F8 / export=F6 is kept
+                if (validateLocked(sp.key, v, false).empty()) {
+                    m_vals[sp.key] = v;
+                    if (isBind(sp.key)) fileBinds.insert(sp.key);
+                }
             }
+            resolveBindCollisions(fileBinds);
+            if (!m_bindNote.empty()) m_loadNote += (m_loadNote.empty() ? "" : "; ") + m_bindNote;
             if (makeBackup) {
                 std::error_code ec;
                 std::filesystem::copy_file(p, m_dir / "config.bak.json", std::filesystem::copy_options::overwrite_existing, ec);
             }
             return true;
+        }
+
+        // v2.88.4: after a load, makes every bound key unique, in table order:
+        //  1. bindings config.json did not set keep their default;
+        //  2. a file binding that uses one of those defaults is rejected (its action goes back to its default);
+        //  3. two file bindings with the same key: the first in table order keeps it;
+        //  4. every rejected / losing binding gets its default if no binding holds it, else it is unbound ("").
+        // Writes what changed to m_bindNote. "" (unbound) never collides.
+        void resolveBindCollisions(std::set<std::string> const& fileBinds) {
+            std::vector<Spec const*> binds;
+            for (auto const& sp : specs()) {
+                if (isBind(sp.key)) binds.push_back(&sp);
+            }
+            std::map<std::string, std::string> owner;  // key text -> binding that holds it
+            for (auto const* sp : binds) {
+                if (fileBinds.count(sp->key)) continue;
+                auto const& t = m_vals[sp->key].s;
+                if (!t.empty() && !owner.count(t)) owner[t] = sp->key;
+            }
+            std::vector<std::pair<Spec const*, std::string>> lost;  // binding, the binding that holds its key
+            for (auto const* sp : binds) {
+                if (!fileBinds.count(sp->key)) continue;
+                auto const& t = m_vals[sp->key].s;
+                if (t.empty()) continue;
+                auto it = owner.find(t);
+                if (it == owner.end()) owner[t] = sp->key;
+                else lost.push_back({ sp, it->second });
+            }
+            for (auto const& [sp, holder] : lost) {
+                std::string wanted = m_vals[sp->key].s;
+                std::string def = sp->sdef;
+                {
+                    int vk = 0, mods = 0;
+                    if (!def.empty() && parseKey(def, vk, mods)) def = keyName(vk, mods);
+                }
+                std::string now;
+                if (!def.empty() && !owner.count(def)) {
+                    now = def;
+                    owner[def] = sp->key;
+                }
+                m_vals[sp->key] = Val::text(now);
+                if (!m_bindNote.empty()) m_bindNote += "; ";
+                m_bindNote += sp->key.substr(5) + " can't use " + wanted + " (already used by " + holder.substr(5) + "), " +
+                              (now.empty() ? std::string("now unbound") : "kept " + now);
+            }
+            if (!m_bindNote.empty()) m_bindNote = "key conflicts in config.json: " + m_bindNote;
         }
 
         std::string dumpLocked(bool typed) const {
@@ -750,6 +804,7 @@ namespace cfg {
         std::map<std::string, Val> m_vals;
         std::filesystem::path m_dir;
         std::string m_loadNote;
+        std::string m_bindNote;  // v2.88.4: key conflicts found by the last loadFile
         std::string m_note;
         bool m_dirty = false;
         bool m_failing = false;

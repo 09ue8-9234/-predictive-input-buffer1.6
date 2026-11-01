@@ -7,7 +7,7 @@
     { "name": "Auto-release and auto-click", "sort": 30, "blurb": "The mod lets go or clicks for you when it is clearly safe.", "match": ["auto-release", "auto-click"] },
     { "name": "Moving objects", "sort": 40, "blurb": "How the prediction deals with objects that move.", "match": ["moving-objects"] },
     { "name": "Prediction", "sort": 20, "blurb": "How far and how carefully the ghost looks ahead, per game mode.", "match": ["^sim-budget", "^smart-prediction$", "horizon$", "^full-ghost", "^predict-", "^robust-saves$", "^ignore-touching", "^cube-late", "^cbf-sync$", "^level-memory$", "^more-time", "-smart$", "^ship-", "^wave-", "^orb-", "^auto-budget$"] },
-    { "name": "Modes and performance", "sort": 50, "blurb": "Training, low latency, performance and per-level behaviour.", "match": ["^low-latency$", "^performance-mode$", "^training-mode$", "^practice-only$", "^tps$", "^per-level-settings$"] }
+    { "name": "Modes and performance", "sort": 50, "blurb": "Training, low latency, performance and per-level behaviour.", "match": ["^low-latency$", "^performance-mode$", "^training-mode$", "^tps$", "^per-level-settings$"] }
   ],
   "fallback": { "name": "More settings", "sort": 60, "blurb": "Settings the app has no group rule for yet." },
   "hidden": ["^config-version$"],

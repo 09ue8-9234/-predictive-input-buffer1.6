@@ -1,9 +1,9 @@
-# Testing app (version 1.0.0)
+# Testing app (version 1.0.1)
 
 A Windows desktop app for the "Testing" mod. It lists every setting, key and action of the mod, so you never edit `config.json` or type pipe commands.
 
 ## Get it
-GitHub -> Actions -> latest run of "Build Mod" -> artifact **Testing App** -> `Testing.exe`. One file, nothing to install (.NET is inside). Windows may show a SmartScreen warning because the exe is not signed: "More info" -> "Run anyway".
+GitHub -> Actions -> latest run of "Build Testing App" -> artifact **Testing App** -> `Testing.exe`. One file, nothing to install (.NET is inside). Windows may show a SmartScreen warning because the exe is not signed: "More info" -> "Run anyway".
 
 ## Use it
 1. First start: it looks for `...\Geometry Dash\geode\config\abhyu.input-buffer\` (Steam). If it can't find it, "Browse..." and pick your Geometry Dash folder. The choice is remembered (`%AppData%\Testing\app.json`).

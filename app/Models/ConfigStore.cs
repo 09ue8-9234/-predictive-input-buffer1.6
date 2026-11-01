@@ -194,11 +194,19 @@ public sealed class ConfigStore
                 BackupNow();
                 _backedUp = true;
             }
+            // 1.0.1: the mod reads the LAST copy of a key that appears twice, so the change goes into the last copy and the
+            // earlier copies of that (known) key are removed. Keys the app doesn't change, known or not, stay as they are.
             foreach (var kv in _overlay)
             {
-                int idx = fresh.FindIndex(e => e.Key == kv.Key);
-                if (idx >= 0) fresh[idx] = (kv.Key, kv.Value);
-                else fresh.Add((kv.Key, kv.Value));
+                int idx = fresh.FindLastIndex(e => e.Key == kv.Key);
+                if (idx < 0)
+                {
+                    fresh.Add((kv.Key, kv.Value));
+                    continue;
+                }
+                fresh[idx] = (kv.Key, kv.Value);
+                for (int i = idx - 1; i >= 0; i--)
+                    if (fresh[i].Key == kv.Key) fresh.RemoveAt(i);
             }
             if (!exists) fresh.Insert(0, ("config-version", Scalar.Of((double)_schema.ConfigVersion)));
             string tmp = FilePath + ".app-tmp";

@@ -365,8 +365,17 @@ public sealed class MainVM : Obs
     {
         _saveTimer.Stop();
         if (_store == null || !_store.Dirty) return;
-        if (GameRunning)
+        // 1.0.1: checked fresh right before writing (the cached GameRunning is only refreshed once a second, so a game
+        // that just started could otherwise get its config.json overwritten). The change stays pending and is saved
+        // by Tick() once the game closes.
+        bool proc = GameWatcher.IsGameRunning();
+        bool pipe = GameWatcher.PipeExists() || _pipe.Connected;
+        if (GameRunning || proc || pipe)
         {
+            PipeVisible = pipe;
+            GameRunning = true;
+            _wasRunning = true;
+            UpdateMode();
             SetStatus("Not saved yet: the game is running (saved when it closes)", true);
             return;
         }
@@ -461,6 +470,7 @@ public sealed class MainVM : Obs
         {
             _wasRunning = false;
             SaveNow();
+            if (GameRunning) return;   // 1.0.1: SaveNow saw the game again (changes stay pending, retried next tick)
             OpenFolder(_modDir);   // the game rewrote config.json (and maybe schema.json) while it ran
             ShowToast("Game closed: settings reloaded from config.json");
             return;

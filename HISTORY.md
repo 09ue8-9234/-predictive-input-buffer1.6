@@ -1,5 +1,16 @@
 # History
 
+## v2.88.4 (Testing app 1.0.1)
+The practice-mode rule is removed (personal use only), and key bindings in config.json are loaded correctly. Every `src/` change:
+- `cfg.hpp`: removed the settings `practice-only` (and its Shift+F10 toggle key), `auto-release-normal-runs` and `fix-practice-queue`. Old keys in config.json are ignored and dropped at the next save; config-version stays 3.
+- `cfg.hpp`: descriptions no longer say "practice mode only", "not legit" or "verified / leaderboard" (wave / robot / dash auto-release, auto-click, TPS, TPS text, AUTO INPUTS tag).
+- `cfg.hpp` fix: bindings are loaded in two steps. Each binding is first checked only for valid key text; then clashes are resolved together, so a swap such as stage F8 / export F6 is no longer lost. Rules: bindings the file did not set keep their default; a file binding that uses one of those defaults is rejected (its action goes back to its default); two file bindings with the same key: the first in table order keeps it; a rejected or losing binding gets its default if free, else it is unbound. Every change is written to the load note (console line `config: key conflicts in config.json: ...`). Live `set` still rejects a clash, as before. Defaults, `writeFileAtomic` and the stage migration are unchanged.
+- `main.cpp`: removed the fields `practiceOnly`, `autoNormalRuns`, `fixPracticeQueue` and their reads; removed the practice-mode gate in front of the buffer, the two gates in wave / robot / dash auto-release and auto-click (they now act in every run), and the fix-practice-queue block.
+- `main.cpp`: the AUTO INPUTS ON tag only shows when `show-auto-tag` is on and an auto option is on (no forced display). The state message's `warnings` field stays but no longer gets the TPS / outside-practice warnings. The console export no longer prints "practice only" and "normal runs". Comments reworded. Header says v2.88.4.
+- The `"practice"` flag in the state message is unchanged (it reports whether practice mode is active).
+- New `tests/cfg_test.cpp` (pure C++17); the app workflow runs it and `tests/prediction_policy_test.cpp` before building.
+- Testing app 1.0.1: an offline save checks right before writing whether the game started (if so the change stays pending); the live-schema comparison covers the whole schema (descriptions, actions, stages, slots, presets, per-level keys, limits); a key that appears twice in config.json is saved into its last copy (the one the mod reads) and the earlier copies are removed; README fixes.
+
 ## v2.88.3 (Testing app 1.0.0)
 Additive changes for the companion app. With the two new settings left on (their defaults) the behaviour is exactly v2.88.2.
 - New `console-link` (on, Ctrl+F5): the named pipe is closed while it is off. New `console-window` (on, Shift+F5): hides / shows the console window. (Ctrl+F4 is taken by `unlimited-delay`.)

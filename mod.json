@@ -3,10 +3,10 @@
 	"gd": {
 		"win": "2.2081"
 	},
-	"version": "v2.88.3",
+	"version": "v2.88.4",
 	"id": "abhyu.input-buffer",
 	"name": "Testing",
 	"developer": "abhyu",
-	"description": "Practice-only testing tool. Runs in the background; controlled from an external console.",
+	"description": "Personal testing tool. Runs in the background; controlled from an external console.",
 	"settings": {}
 }

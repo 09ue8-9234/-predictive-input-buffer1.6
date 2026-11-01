@@ -1,4 +1,4 @@
-// Testing (id abhyu.input-buffer) v2.88.3: Click Before Frames engine, no in-game UI. All settings live in config.json (cfg.hpp) and are driven from an external console over a named pipe.
+// Testing (id abhyu.input-buffer) v2.88.4: Click Before Frames engine, no in-game UI. All settings live in config.json (cfg.hpp) and are driven from an external console over a named pipe.
 //
 // When you click (or release, in wave / robot), a hidden "ghost" player is simulated
 // ahead with your input. If the ghost dies, the input is retried with 1..N ticks of
@@ -234,7 +234,6 @@ namespace {
         bool smart = true;
         bool console = false;
         double budgetMs = 6.0;
-        bool practiceOnly = true;    // v2.1: only buffer in practice mode
         int groundHorizon = 130;     // v2.1: how far ahead cube/ball/spider predictions look
         int releaseShift = 0;        // v2.1: delay of the last delivered press, reused for its release
         int waveHorizon = 65;        // v2.2: how far ahead wave predictions look (mini = 15 less)
@@ -253,7 +252,7 @@ namespace {
         bool avoidMovers = true;     // v2.4: don't buffer when the ghost's path has moving objects
         bool sawMover = false;       // v2.4: a run this decision touched a moving object
         bool trackMovers = false;    // v2.5.1: watch objects only in this run (not in every search run)
-        bool autoRelease = false;    // v2.4: wave auto-release (practice mode only)
+        bool autoRelease = false;    // v2.4: wave auto-release
         int autoWindow = 6;          // v2.4: hold must die within this many ticks to auto-release
         bool autoReleased = false;   // v2.4: we released for you; your real release is swallowed
         bool autoClick = false;      // v2.79: click for you when idling dies and a click is fully safe
@@ -280,7 +279,6 @@ namespace {
         bool fixRestart = true;
         bool fixDualHarmless = false;
         bool fixLowLatQueue = false;
-        bool fixPracticeQueue = false;
         bool fixGroupOn = false;
         bool fixOrbChecks = false;
         bool fixMoreTimeChecks = false;
@@ -338,8 +336,7 @@ namespace {
         bool spiderSmart = true;     // v2.15: spider-aware landing + "could you have flipped back" scoring
         int retapAt = -1;            // v2.15: ticks after the input at which the ghost taps again (-1 = never)
         bool robotSmart = true;      // v2.12: robot presses count as safe if some hold length survives
-        bool robotAutoRelease = false;  // v2.12: robot auto-release (practice mode only)
-        bool autoNormalRuns = false; // v2.14: let auto-release work outside practice too
+        bool robotAutoRelease = false;  // v2.12: robot auto-release
         bool usedThisAttempt = false;      // v2.46: the buffer was on at some point of this attempt
         bool learn = true;           // v2.13: per-level memory learned from your runs
         bool fullState = true;       // v2.11.1: copy the full v2.8 player state into the ghost
@@ -933,7 +930,6 @@ namespace {
         buf.smart = cfg::b("smart-prediction");
         buf.budgetMs = cfg::d("sim-budget-ms");
         buf.autoBudget = cfg::b("auto-budget");
-        buf.practiceOnly = cfg::b("practice-only");
         buf.groundHorizon = static_cast<int>(cfg::i("ground-horizon"));
         buf.waveHorizon = static_cast<int>(cfg::i("wave-horizon"));
         buf.assumeOrbs = cfg::b("orb-assume-hit");
@@ -980,7 +976,6 @@ namespace {
         buf.shipSpamGap = static_cast<int>(cfg::i("ship-spam-gap"));
         buf.cbfSync = cfg::b("cbf-sync");
         buf.robotAutoRelease = cfg::b("robot-auto-release");
-        buf.autoNormalRuns = cfg::b("auto-release-normal-runs");
         buf.autoClick = cfg::b("auto-click");
         buf.spamStreak = std::clamp(static_cast<int>(cfg::i("wave-spam-streak")), 2, 6);
         buf.portalPredict = cfg::b("predict-through-portals");
@@ -1016,7 +1011,6 @@ namespace {
         buf.fixRestart = cfg::b("fix-restart-state");
         buf.fixDualHarmless = cfg::b("fix-dual-harmless");
         buf.fixLowLatQueue = cfg::b("fix-lowlat-queue");
-        buf.fixPracticeQueue = cfg::b("fix-practice-queue");
         buf.fixGroupOn = cfg::b("fix-group-on");
         buf.fixOrbChecks = cfg::b("fix-orb-checks");
         buf.fixMoreTimeChecks = cfg::b("fix-more-time-checks");
@@ -1093,14 +1087,14 @@ namespace {
         }
         float dt = buf.tickLength > 0.001f ? buf.tickLength : TICK;
         text += fmt::format("{} | physics ~{:.0f} steps/s\n", stageText(), 60.f / dt);
-        text += fmt::format("budget {:g} ms | smart {} | full state {} | robust {} | late crash {} | practice only {}\n", buf.budgetMs,
-            buf.smart, buf.fullState, buf.robustSaves, buf.lateCrash, buf.practiceOnly);
+        text += fmt::format("budget {:g} ms | smart {} | full state {} | robust {} | late crash {}\n", buf.budgetMs,
+            buf.smart, buf.fullState, buf.robustSaves, buf.lateCrash);
         text += fmt::format("orbs: align {} (ground {}, {}t) timing {} assume {} both {} | memory {} ({} spots)\n", buf.orbAlign,
             buf.orbAlignGround, buf.orbWindow, buf.orbTiming, buf.assumeOrbs, buf.tryBothOrbs, buf.learn, memorySpots());
         text += fmt::format("wave: v4.6 {} margin {} horizon {} spam gap {} | robot smart {} | spider smart {} | ship {} (max {}t)\n",
             buf.waveV46, buf.waveMargin, buf.waveHorizon, buf.spamGap, buf.robotSmart, buf.spiderSmart, buf.shipBuffer, buf.shipMaxDelay);
-        text += fmt::format("auto-release: wave {} robot {} dash {} normal runs {} window {} | movers: avoid {} predict {}\n",
-            buf.autoRelease, buf.robotAutoRelease, buf.dashAutoRelease, buf.autoNormalRuns, buf.autoWindow, buf.avoidMovers,
+        text += fmt::format("auto-release: wave {} robot {} dash {} window {} | movers: avoid {} predict {}\n",
+            buf.autoRelease, buf.robotAutoRelease, buf.dashAutoRelease, buf.autoWindow, buf.avoidMovers,
             buf.predictMovers);
         text += fmt::format("debug: drift check {} | path view {} | perf log {} | death log {} | ignore touching {}\n", buf.driftCheck,
             buf.showPath, buf.perfLog, buf.deathLog, buf.ignoreTouching);
@@ -3452,9 +3446,8 @@ namespace {
     void refreshOverlays() {
         bool autoOn = buf.autoRelease || buf.robotAutoRelease || buf.dashAutoRelease || buf.autoClick;
         if (buf.autoTagLabel) {
-            // v2.87.1: shown by itself (display only) whenever an automatic input can act outside practice mode
-            bool actsOutsidePractice = autoOn && buf.autoNormalRuns && buf.enabled;
-            buf.autoTagLabel->setVisible((buf.showAutoTag && autoOn) || actsOutsidePractice);
+            // v2.88.4: only shown when the AUTO INPUTS ON switch is on (no forced display)
+            buf.autoTagLabel->setVisible(buf.showAutoTag && autoOn);
         }
         if (buf.tpsLabel) {
             buf.tpsLabel->setString(fmt::format("TPS {}", buf.tps).c_str());
@@ -3580,10 +3573,6 @@ namespace {
             }
         }
         if (!buf.enabled) {
-            buf.appliedInput = down;
-            return false;
-        }
-        if (buf.practiceOnly && !layer->m_isPracticeMode) {
             buf.appliedInput = down;
             return false;
         }
@@ -4155,7 +4144,7 @@ namespace {
         say("stage -> {}", stageText());
     }
 
-    // v2.4 wave auto-release (practice mode only): while you hold in wave, check every
+    // v2.4 wave auto-release: while you hold in wave, check every
     // tick whether holding crashes within the next `autoWindow` ticks. If it does and
     // letting go now clearly survives longer, let go for you. Your own release later is
     // swallowed, and your next press works as normal.
@@ -4181,9 +4170,6 @@ namespace {
             return;
         }
         if (buf.fixAutoThrottle && tickCount < autoCooldownUntil) {
-            return;
-        }
-        if (!layer->m_isPracticeMode && !buf.autoNormalRuns) {
             return;
         }
         if (!buf.queue.empty() || !buf.realInput || !buf.appliedInput || !buf.isPlayer1 || !buf.ghost1) {
@@ -4247,9 +4233,6 @@ namespace {
         if (buf.fixAutoThrottle && tickCount < autoCooldownUntil) {
             return;
         }
-        if (!layer->m_isPracticeMode && !buf.autoNormalRuns) {
-            return;
-        }
         if (!buf.queue.empty() || buf.realInput || buf.appliedInput || !buf.isPlayer1 || !buf.ghost1 || buf.sinceInput < st(4)) {
             return;
         }
@@ -4304,14 +4287,6 @@ namespace {
         // the next attempt)
         if (player->m_isDead) {
             return;
-        }
-        // v2.87.1 fix-practice-queue: practice mode ended (or "practice only" was switched on) while a
-        // delayed input was waiting: drop it and give the game your real button, like setStage does
-        if (buf.fixPracticeQueue && !buf.queue.empty() && buf.practiceOnly && !layer->m_isPracticeMode) {
-            resetPending();
-            if (buf.appliedInput != buf.realInput && !buf.autoReleased) {
-                sendButton(layer, buf.realInput);
-            }
         }
         if ((buf.avoidMovers || buf.predictMovers) && !watched.empty()) {
             updateWatched();
@@ -5099,13 +5074,7 @@ namespace {
         auto* layer = GameManager::get()->m_playLayer;
         auto const& st = sessionStats;
         float dt = buf.tickLength > 0.001f ? buf.tickLength : TICK;
-        std::string warn;
-        if (buf.tps != 240) {
-            warn += "TPS is not 240: runs are not legit. ";
-        }
-        if (layer && buf.enabled && !layer->m_isPracticeMode && !buf.practiceOnly) {
-            warn += "Buffer is active outside practice mode (not for verified runs). ";
-        }
+        std::string warn;  // v2.88.4: no practice-mode / TPS warnings any more (the field stays for the app)
         std::string o = "{\"type\":\"state\"";
         auto num = [&](char const* k, double v) { o += std::string(",\"") + k + "\":" + cfg::jnum(v); };
         auto flag = [&](char const* k, bool v) { o += std::string(",\"") + k + "\":" + (v ? "true" : "false"); };
@@ -5354,7 +5323,7 @@ $on_mod(Loaded) {
 // v2.79 custom TPS (from the v2.80 build): above 240 the level is stepped in 1/tps pieces.
 // update() runs once per step and getModifiedDelta() hands the step through unrounded, so
 // each call is exactly one physics step. (Below 240 the game's own step count would need
-// patching, so 240 is the floor.) Runs at anything but 240 aren't legit completions.
+// patching, so 240 is the floor.)
 static bool tpsDriving = false;
 static double tpsCarry = 0.0;
 
