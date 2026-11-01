@@ -1,0 +1,30 @@
+name: Build Testing App
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+jobs:
+  app:
+    name: Testing app (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Developer command prompt (MSVC)
+        uses: ilammy/msvc-dev-cmd@v1
+      - name: Generate the settings schema from src/cfg.hpp
+        shell: pwsh
+        run: |
+          $version = (Get-Content mod.json -Raw | ConvertFrom-Json).version
+          cl /nologo /std:c++17 /EHsc /utf-8 tools\schema-dump.cpp /Fe:schema-dump.exe
+          if ($LASTEXITCODE -ne 0) { throw "schema-dump did not compile" }
+          .\schema-dump.exe app\Assets\schema.bundled.json $version
+          if ($LASTEXITCODE -ne 0) { throw "schema-dump failed" }
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      - name: Publish the app (one exe)
+        run: dotnet publish app/Testing.App.csproj -c Release -o app-out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Testing App
+          path: app-out/Testing.exe
