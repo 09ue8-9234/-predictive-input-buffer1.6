@@ -1,10 +1,10 @@
 # History
 
 ## v2.89.0
-- `unlimited-delay` (Ctrl+F4) is now maxed out. While it is on: (1) every mode looks 128 frames (512 ticks at 240 steps/s) ahead instead of its normal look-ahead (cube / ball / spider 130 ticks = 32.5f, wave 65 ticks, ship / ufo / swing 48 ticks = 12f); (2) the ship has no delay limit either (before, it kept `ship-max-delay`, 0..16 ticks); (3) the "more time at death spots" hold-back for wave / ship is no longer capped at 1 frame. The F10 path view draws the full 128-frame ghost path, and its live path updates 5 times a second instead of 20 (each update runs two 512-tick ghosts).
-- No new setting, nothing changes with `unlimited-delay` off (identical to v2.88.2). The look-ahead / delay settings (`ground-horizon`, `wave-horizon`, stages, `ship-max-delay`) are not touched; auto-release and auto-click keep their normal look-ahead. config-version stays 3.
-- Cost: a path that stays alive is simulated for 512 ticks per tried delay instead of 48-130, so the prediction time budget (`sim-budget-ms`) cuts the search off sooner; raise it if the log shows "prediction budget hit". A farther look-ahead also sees more obstacles, so fewer very early clicks end up fully safe. Nothing was compiled or run when this was written.
-- `prediction_policy.hpp`: `UNLIMITED_LOOKAHEAD_TICKS`, `lookAheadTicks()`, `maxDelayTicks()` now gives the ship unlimited too; tests updated.
+- `unlimited-delay` (Ctrl+F4): while it is on, every mode looks twice as far ahead as normal: cube / ball / spider 130 -> 260 ticks (32.5f -> 65f), wave 65 -> 130 (16f -> 32f), ship / ufo / swing 48 -> 96 (12f -> 24f); the ship's own max delay is doubled (up to 32 ticks). The F10 path view draws the longer ghost path (update rate unchanged). The delay cap itself is as in v2.88.x.
+- No new setting; nothing changes with `unlimited-delay` off (identical to v2.88.2). `ground-horizon`, `wave-horizon`, stages and `ship-max-delay` are not touched; auto-release and auto-click keep their normal look-ahead. config-version stays 3.
+- A first v2.89.0 draft used 128 frames everywhere and was too heavy / choppy in-game; replaced by the 2x rule above. Nothing was compiled in the game when this was written.
+- `prediction_policy.hpp`: `lookAheadTicks()`, ship cap doubling in `maxDelayTicks()`; tests updated.
 
 ## v2.88.2
 - Build fix: v2.88.1 did not compile (`healGhosts` was defined after the place that calls it). It is now defined before `intercept`. No behaviour change from v2.88.1.

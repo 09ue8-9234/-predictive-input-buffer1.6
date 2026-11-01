@@ -2385,10 +2385,10 @@ namespace {
         return st(mini ? std::max(20, wh - 15) : wh);  // v4.6: 65 normal / 50 mini
     }
 
-    // v2.89: with unlimited-delay on, every mode looks 128 frames (512 ticks) ahead instead of its normal
+    // v2.89: with unlimited-delay on, every mode looks twice as far ahead as its normal
     // look-ahead (`normal` is already st() scaled). Off = the normal look-ahead, unchanged.
     int lookAhead(int normal) {
-        return prediction_policy::lookAheadTicks(buf.unlimitedDelay, normal, st(prediction_policy::UNLIMITED_LOOKAHEAD_TICKS));
+        return prediction_policy::lookAheadTicks(buf.unlimitedDelay, normal);
     }
 
     // v2.6 orb alignment: a press made a little before reaching an orb would be wasted
@@ -3189,7 +3189,7 @@ namespace {
         if (!buf.showPath || buf.perfMode || !buf.pathNode || !buf.ghost1 || buf.simulating || p1->m_isDead || layer->m_isPlatformer) {
             return;
         }
-        if (tickCount < buf.pathHoldUntil || !buf.queue.empty() || tickCount % st(buf.unlimitedDelay ? 48 : 12) != 0) {
+        if (tickCount < buf.pathHoldUntil || !buf.queue.empty() || tickCount % st(12) != 0) {
             return;
         }
         bool twoPlayer = layer->m_level && layer->m_level->m_twoPlayerMode;
@@ -3703,7 +3703,7 @@ namespace {
         if (anyWave) {
             horizon = fullWaveHorizon(mini);
         }
-        horizon = lookAhead(horizon);  // v2.89: unlimited-delay looks 128 frames ahead in every mode
+        horizon = lookAhead(horizon);  // v2.89: unlimited-delay looks 2x as far ahead in every mode
         // v2.88: unlimited-delay removes the stage's cap; ship-uses-stage lets the ship follow the stage
         int maxDelay = st(prediction_policy::maxDelayTicks(anyWave, anyShip, buf.unlimitedDelay, buf.shipUsesStage,
             buf.ticksAll, buf.ticksWave, buf.shipMaxDelay));
@@ -3852,7 +3852,7 @@ namespace {
                 // v2.67: wave / ship input that's already safe (if you keep reacting) is held back
                 // at most 1 frame here. Up to 4f (16t) made fast zigzags at death spots feel late:
                 // every later click in the rhythm gets shifted by the same amount.
-                int moreMax = (cubeStyleWave || shipInput) && !buf.unlimitedDelay ? std::min(maxDelay, st(4)) : maxDelay;  // v2.89: unlimited lifts the 1f cap
+                int moreMax = (cubeStyleWave || shipInput) ? std::min(maxDelay, st(4)) : maxDelay;
                 for (int k = 1; k <= moreMax; ++k) {
                     SimEnd e;
                     if (clickOverTime()) {

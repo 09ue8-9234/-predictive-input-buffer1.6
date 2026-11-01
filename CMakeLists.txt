@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.21)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-project(AbhyuInputBuffer VERSION 2.88.2)
+project(AbhyuInputBuffer VERSION 2.89.0)
 
 file(GLOB SOURCES CONFIGURE_DEPENDS src/*.cpp)
 add_library(${PROJECT_NAME} SHARED ${SOURCES})
