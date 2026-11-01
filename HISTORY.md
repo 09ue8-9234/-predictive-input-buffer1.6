@@ -1,6 +1,11 @@
 # History
 
+## v2.88.1
+- Fix: the buffer could silently stop working until the next level load. The mod's state is shared by every level, and a level's quit cleanup (`onQuit`) tore it down even when a different level had already taken it over, deleting that level's ghost players; without ghosts every prediction answers "safe" and every input passes through. A quitting level now leaves the state alone when another level owns it, and if the ghost players are ever missing while the mod is on they are rebuilt (one console line: "ghost players were missing ... rebuilt them", or "could not be rebuilt").
+- The startup line says v2.88.1.
+
 ## v2.88.0
+Ported from BASU's "Click Before Frames" v2.84.0 (id basu.input-buffer, the older version of this mod's lineage), by meaning, each behind its own setting. With all five new settings off the behaviour is exactly v2.87.2.
 - `unlimited-delay` (off, key Ctrl+F4): no cap on how early an input may be. An early input is held back tick by tick until the first timing whose path survives, up to 24000 ticks (100 s). The stage then only matters as on / off. The search is still limited by the prediction time budget; while it is on, 'Auto time budget' no longer cuts the budget to one frame. The log / state text shows "unlimited". (A separate setting, not a new stage, so no stage number moved and config-version stays 3.)
 - `ship-uses-stage` (on): the ship may use the stage's delay (or unlimited) like every other mode, never less than `ship-max-delay`. Nothing changes below the 1f stage.
 - `orb-press-passthrough` (on): a press that already touches an orb goes to the game unchanged (never past a queued input), and orb alignment never re-times a press whose timing already activates the orb. This replaces the v2.26 re-timing of presses inside an orb while on; turn it off to get that back.
