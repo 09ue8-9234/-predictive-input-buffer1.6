@@ -1,5 +1,8 @@
 # History
 
+## v2.88.2
+- Build fix: v2.88.1 did not compile (`healGhosts` was defined after the place that calls it). It is now defined before `intercept`. No behaviour change from v2.88.1.
+
 ## v2.88.1
 - Fix: the buffer could silently stop working until the next level load. The mod's state is shared by every level, and a level's quit cleanup (`onQuit`) tore it down even when a different level had already taken it over, deleting that level's ghost players; without ghosts every prediction answers "safe" and every input passes through. A quitting level now leaves the state alone when another level owns it, and if the ghost players are ever missing while the mod is on they are rebuilt (one console line: "ghost players were missing ... rebuilt them", or "could not be rebuilt").
 - The startup line says v2.88.1.

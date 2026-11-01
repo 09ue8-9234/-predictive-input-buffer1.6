@@ -1,4 +1,4 @@
-// Testing (id abhyu.input-buffer) v2.88.1: Click Before Frames engine, no in-game UI. All settings live in config.json (cfg.hpp) and are driven from an external console over a named pipe.
+// Testing (id abhyu.input-buffer) v2.88.2: Click Before Frames engine, no in-game UI. All settings live in config.json (cfg.hpp) and are driven from an external console over a named pipe.
 //
 // When you click (or release, in wave / robot), a hidden "ghost" player is simulated
 // ahead with your input. If the ghost dies, the input is retried with 1..N ticks of
@@ -3455,6 +3455,34 @@ namespace {
         return text;
     }
 
+    // v2.88.1: the ghost players are missing while the mod is on (an old level's cleanup ran after the new
+    // level started, or creating them failed). simulate() answers "fully safe" without ghosts, so the
+    // buffer silently stopped until the next level load. Rebuild them, and say so once per rebuild.
+    void healGhosts(PlayLayer* layer) {
+        if ((buf.ghost1 && buf.ghost2) || buf.simulating || !layer || !layer->m_player1) {
+            return;
+        }
+        static bool failedTold = false;
+        if (!buf.ghost1) {
+            buf.ghost1 = makeGhost(layer);
+        }
+        if (!buf.ghost2) {
+            buf.ghost2 = makeGhost(layer);
+        }
+        if (buf.ghost1 && buf.ghost2) {
+            buf.ghostLayerBase = buf.ghostLayer ? buf.ghostLayer->getChildrenCount() : 0;
+            if (!buf.owner) {
+                buf.owner = layer;
+            }
+            failedTold = false;
+            say("ghost players were missing (an old level's cleanup?): rebuilt them");
+        }
+        else if (!failedTold) {
+            failedTold = true;
+            say("ghost players are missing and could not be rebuilt: the buffer cannot predict");
+        }
+    }
+
     bool intercept(GJBaseGameLayer* self, bool down, bool isPlayer1) {
         ClickTimer timer;
         clickBudget();
@@ -4210,34 +4238,6 @@ namespace {
         say("AUTO click{}: doing nothing dies in {}t, clicking (hold {}t) is safe", robot ? " (robot)" : "", idle, hold);
     }
 
-    // v2.88.1: the ghost players are missing while the mod is on (an old level's cleanup ran after the new
-    // level started, or creating them failed). simulate() answers "fully safe" without ghosts, so the
-    // buffer silently stopped until the next level load. Rebuild them, and say so once per rebuild.
-    void healGhosts(PlayLayer* layer) {
-        if ((buf.ghost1 && buf.ghost2) || buf.simulating || !layer || !layer->m_player1) {
-            return;
-        }
-        static bool failedTold = false;
-        if (!buf.ghost1) {
-            buf.ghost1 = makeGhost(layer);
-        }
-        if (!buf.ghost2) {
-            buf.ghost2 = makeGhost(layer);
-        }
-        if (buf.ghost1 && buf.ghost2) {
-            buf.ghostLayerBase = buf.ghostLayer ? buf.ghostLayer->getChildrenCount() : 0;
-            if (!buf.owner) {
-                buf.owner = layer;
-            }
-            failedTold = false;
-            say("ghost players were missing (an old level's cleanup?): rebuilt them");
-        }
-        else if (!failedTold) {
-            failedTold = true;
-            say("ghost players are missing and could not be rebuilt: the buffer cannot predict");
-        }
-    }
-
     void deliverPending(PlayLayer* layer, PlayerObject* player) {
         healGhosts(layer);
         if (buf.autoClicked && ++buf.autoClickAge > st(24)) {
@@ -4485,7 +4485,7 @@ $on_mod(Loaded) {
     if (Loader::get()->isModLoaded("square3ang.cbfextrapolate")) {
         say("CBF Extrapolate detected: assumed to be visual only (not verified), predictions are not adjusted for it");
     }
-    say("v2.88.1 loaded. The stage key cycles: 0.25f -> 0.5f -> 1f -> 2f -> 4f -> 6f -> 8f -> custom A-D -> off");
+    say("v2.88.2 loaded. The stage key cycles: 0.25f -> 0.5f -> 1f -> 2f -> 4f -> 6f -> 8f -> custom A-D -> off");
     if (!importNote.empty()) {
         say("{}", importNote);
     }
