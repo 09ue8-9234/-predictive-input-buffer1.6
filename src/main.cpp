@@ -1,4 +1,4 @@
-// Testing (id abhyu.input-buffer) v2.89.0: Click Before Frames engine, no in-game UI. All settings live in config.json (cfg.hpp) and are driven from an external console over a named pipe.
+// Testing (id abhyu.input-buffer) v2.88.2: Click Before Frames engine, no in-game UI. All settings live in config.json (cfg.hpp) and are driven from an external console over a named pipe.
 //
 // When you click (or release, in wave / robot), a hidden "ghost" player is simulated
 // ahead with your input. If the ghost dies, the input is retried with 1..N ticks of
@@ -166,9 +166,25 @@ namespace {
                   FIRST_CUSTOM_STAGE + CUSTOM_SLOTS == STAGE_OFF && !STAGES[FIRST_CUSTOM_STAGE - 1].custom,
         "custom slots sit right before the off stage");
     static_assert(cfg::STAGE_DEFAULT == STAGE_05F, "a fresh install starts on 0.5f");
-    constexpr char const* CUSTOM_TICKS_KEY[CUSTOM_SLOTS] = { "custom-ticks", "custom-b-ticks", "custom-c-ticks", "custom-d-ticks" };
-    constexpr char const* CUSTOM_WAVE_KEY[CUSTOM_SLOTS] = { "custom-wave-ticks", "custom-b-wave-ticks", "custom-c-wave-ticks", "custom-d-wave-ticks" };
-    constexpr char const* CUSTOM_NAME_KEY[CUSTOM_SLOTS] = { "custom-name", "custom-b-name", "custom-c-name", "custom-d-name" };
+    // v2.88.2: the key tables and the stage / preset data live in cfg.hpp (the companion app reads them from there);
+    // the checks below break the build if this file and cfg.hpp ever disagree.
+    static_assert(cfg::CUSTOM_SLOT_COUNT == CUSTOM_SLOTS, "custom slot count must match cfg.hpp");
+    constexpr auto& CUSTOM_TICKS_KEY = cfg::CUSTOM_TICKS_KEYS;
+    constexpr auto& CUSTOM_WAVE_KEY = cfg::CUSTOM_WAVE_KEYS;
+    constexpr auto& CUSTOM_NAME_KEY = cfg::CUSTOM_NAME_KEYS;
+    constexpr bool stagesMatchCfg() {
+        for (int i = 0; i < STAGE_COUNT; ++i) {
+            if (STAGES[i].enabled != cfg::STAGE_TABLE[i].enabled || STAGES[i].ticksAll != cfg::STAGE_TABLE[i].ticksAll ||
+                STAGES[i].ticksWave != cfg::STAGE_TABLE[i].ticksWave || STAGES[i].custom != cfg::STAGE_TABLE[i].custom ||
+                STAGES[i].slot != cfg::STAGE_TABLE[i].slot) {
+                return false;
+            }
+        }
+        return true;
+    }
+    static_assert(stagesMatchCfg(), "STAGES table must match cfg::STAGE_TABLE");
+    static_assert(cfg::PRESET_COUNT == 3 && cfg::PRESETS[0].stage == STAGE_2F && cfg::PRESETS[1].stage == STAGE_4F && cfg::PRESETS[2].stage == STAGE_8F,
+                  "presets: Safe = 2f, Balanced = 4f, Aggressive = 8f");
 
     struct QueuedInput {
         int ticksLeft;
@@ -477,6 +493,9 @@ namespace {
             return *p;
         }
         bool connected() const { return m_connected.load(); }
+    // v2.88.2: console link switch (setting 'console-link'); off = the pipe is closed, nothing can connect
+    void setEnabled(bool on) { m_enabled = on; }
+    bool enabled() const { return m_enabled.load(); }
         bool takeHello() { return m_hello.exchange(false); }
         bool hasCommands() const { return m_hasCmds.load(); }
         int dropped() const { return m_dropped.load(); }  // v2.87.1: commands refused because the queue was full
@@ -669,28 +688,42 @@ namespace {
 
     private:
 #ifdef GEODE_IS_WINDOWS
+        // v2.88.2: the pipe only exists while the 'console-link' setting is on (default on). Switching it off closes
+        // the pipe handle, so nothing can connect and a connected app is dropped. If the pipe can't be created
+        // (name still taken, no rights...), try again with a growing pause (1 s, 2 s ... 30 s) instead of giving up
+        // for the whole session. The game thread tells the player once when it fails and once when it works.
         void pipeLoop() {
-            // v2.87.1: if the pipe can't be created (name still taken, no rights...), try again with a growing
-            // pause (1 s, 2 s ... 30 s) instead of giving up for the whole session. The game thread tells
-            // the player once when it fails and once when it works (say() isn't thread-safe).
-            HANDLE h = INVALID_HANDLE_VALUE;
             DWORD wait = 1000;
             for (;;) {
-                h = CreateNamedPipeA("\\\\.\\pipe\\abhyu-input-buffer-testing", PIPE_ACCESS_DUPLEX,
+                if (!m_enabled.load()) {
+                    Sleep(100);
+                    continue;
+                }
+                HANDLE h = CreateNamedPipeA("\\\\.\\pipe\\abhyu-input-buffer-testing", PIPE_ACCESS_DUPLEX,
                     PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_NOWAIT | PIPE_REJECT_REMOTE_CLIENTS, 1, 1 << 16, 1 << 16, 0, nullptr);
-                if (h != INVALID_HANDLE_VALUE) {
-                    break;
+                if (h == INVALID_HANDLE_VALUE) {
+                    if (!m_pipeFailed.load()) {
+                        m_pipeError = static_cast<unsigned long>(GetLastError());
+                        m_pipeFailed = true;
+                    }
+                    Sleep(wait);
+                    wait = std::min<DWORD>(wait * 2, 30000);
+                    continue;
                 }
-                if (!m_pipeFailed.load()) {
-                    m_pipeError = static_cast<unsigned long>(GetLastError());
-                    m_pipeFailed = true;
+                wait = 1000;
+                if (m_pipeFailed.load()) {
+                    m_pipeRecovered = true;
                 }
-                Sleep(wait);
-                wait = std::min<DWORD>(wait * 2, 30000);
+                servePipe(h);
+                CloseHandle(h);
+                m_connected = false;
+                std::lock_guard lock(m_outMutex);
+                m_out.clear();
             }
-            if (m_pipeFailed.load()) {
-                m_pipeRecovered = true;
-            }
+        }
+
+        // Serves one pipe instance until the console link is switched off.
+        void servePipe(HANDLE h) {
             bool connected = false;
             std::string inbuf, pending;
             auto drop = [&] {
@@ -703,6 +736,12 @@ namespace {
                 m_out.clear();
             };
             for (;;) {
+                if (!m_enabled.load()) {
+                    if (connected) {
+                        DisconnectNamedPipe(h);
+                    }
+                    return;
+                }
                 if (!connected) {
                     BOOL ok = ConnectNamedPipe(h, nullptr);
                     DWORD e = ok ? 0 : GetLastError();
@@ -829,6 +868,7 @@ namespace {
         }
 #endif
 
+        std::atomic<bool> m_enabled{ true };
         std::atomic<bool> m_connected{ false };
         std::atomic<bool> m_hello{ false };
         std::atomic<bool> m_hasCmds{ false };
@@ -842,6 +882,22 @@ namespace {
         std::deque<Cmd> m_cmds;
         std::deque<std::string> m_out;
     };
+    // v2.88.2: console link (the pipe) and console window switches; both default ON = how it always was.
+    void applyConsoleSettings() {
+        PipeServer::get().setEnabled(cfg::b("console-link"));
+#ifdef GEODE_IS_WINDOWS
+        static int applied = -1;
+        int want = cfg::b("console-window") ? 1 : 0;
+        if (want != applied) {
+            if (want == 0 || applied != -1) {
+                if (HWND window = GetConsoleWindow()) {
+                    ShowWindow(window, want ? SW_SHOWNA : SW_HIDE);
+                }
+            }
+            applied = want;
+        }
+#endif
+    }
     std::string g_lastDecision;  // last SAVED / TRAIN line, for the console's state message
 
     std::deque<std::string> exportLines;
@@ -2385,12 +2441,6 @@ namespace {
         return st(mini ? std::max(20, wh - 15) : wh);  // v4.6: 65 normal / 50 mini
     }
 
-    // v2.89: with unlimited-delay on, every mode looks twice as far ahead as its normal
-    // look-ahead (`normal` is already st() scaled). Off = the normal look-ahead, unchanged.
-    int lookAhead(int normal) {
-        return prediction_policy::lookAheadTicks(buf.unlimitedDelay, normal);
-    }
-
     // v2.6 orb alignment: a press made a little before reaching an orb would be wasted
     // (or jump off the ground instead). Find the delay that lands the press inside the
     // orb, like the cube buffer does for jumps. Returns that delay, or 0.
@@ -3199,7 +3249,7 @@ namespace {
         bool ship = p1->m_isShip || (p2 && p2->m_isShip);
         bool flyer = isFlying(p1) || (p2 && isFlying(p2));
         bool mini = (p1->m_isDart && p1->m_vehicleSize < 1.f) || (p2 && p2->m_isDart && p2->m_vehicleSize < 1.f);
-        int horizon = lookAhead(wave ? fullWaveHorizon(mini) : st(flyer ? 48 : std::clamp(buf.groundHorizon, 48, 240)));  // v2.89
+        int horizon = wave ? fullWaveHorizon(mini) : st(flyer ? 48 : std::clamp(buf.groundHorizon, 48, 240));
         bool down = !buf.appliedInput;
         int releaseAfter = down && !wave && !ship ? holdEstimate() : -1;
 
@@ -3281,9 +3331,7 @@ namespace {
     // v2.51 per-level settings: your switches (v2.59: not the stage, not low latency) are remembered for each level and
     // come back when you open it again. Outside a level (and in levels you haven't changed
     // anything in) the normal settings apply.
-    constexpr char const* PROFILE_KEYS[] = { "robust-saves", "orb-align", "orb-timing", "level-memory",
-        "more-time-death-spots", "ship-buffer", "ufo-smart", "ball-smart", "swing-smart", "cbf-sync", "predict-moving-objects",
-        "training-mode" };
+    constexpr auto& PROFILE_KEYS = cfg::PROFILE_KEYS;  // v2.88.2: the list lives in cfg.hpp (the app shows which settings are per level)
 
     struct Globals {
         bool have = false;
@@ -3459,34 +3507,6 @@ namespace {
             text += "Run check: " + lastBench + "\n";
         }
         return text;
-    }
-
-    // v2.88.1: the ghost players are missing while the mod is on (an old level's cleanup ran after the new
-    // level started, or creating them failed). simulate() answers "fully safe" without ghosts, so the
-    // buffer silently stopped until the next level load. Rebuild them, and say so once per rebuild.
-    void healGhosts(PlayLayer* layer) {
-        if ((buf.ghost1 && buf.ghost2) || buf.simulating || !layer || !layer->m_player1) {
-            return;
-        }
-        static bool failedTold = false;
-        if (!buf.ghost1) {
-            buf.ghost1 = makeGhost(layer);
-        }
-        if (!buf.ghost2) {
-            buf.ghost2 = makeGhost(layer);
-        }
-        if (buf.ghost1 && buf.ghost2) {
-            buf.ghostLayerBase = buf.ghostLayer ? buf.ghostLayer->getChildrenCount() : 0;
-            if (!buf.owner) {
-                buf.owner = layer;
-            }
-            failedTold = false;
-            say("ghost players were missing (an old level's cleanup?): rebuilt them");
-        }
-        else if (!failedTold) {
-            failedTold = true;
-            say("ghost players are missing and could not be rebuilt: the buffer cannot predict");
-        }
     }
 
     bool intercept(GJBaseGameLayer* self, bool down, bool isPlayer1) {
@@ -3703,7 +3723,6 @@ namespace {
         if (anyWave) {
             horizon = fullWaveHorizon(mini);
         }
-        horizon = lookAhead(horizon);  // v2.89: unlimited-delay looks 2x as far ahead in every mode
         // v2.88: unlimited-delay removes the stage's cap; ship-uses-stage lets the ship follow the stage
         int maxDelay = st(prediction_policy::maxDelayTicks(anyWave, anyShip, buf.unlimitedDelay, buf.shipUsesStage,
             buf.ticksAll, buf.ticksWave, buf.shipMaxDelay));
@@ -4245,6 +4264,34 @@ namespace {
         say("AUTO click{}: doing nothing dies in {}t, clicking (hold {}t) is safe", robot ? " (robot)" : "", idle, hold);
     }
 
+    // v2.88.1: the ghost players are missing while the mod is on (an old level's cleanup ran after the new
+    // level started, or creating them failed). simulate() answers "fully safe" without ghosts, so the
+    // buffer silently stopped until the next level load. Rebuild them, and say so once per rebuild.
+    void healGhosts(PlayLayer* layer) {
+        if ((buf.ghost1 && buf.ghost2) || buf.simulating || !layer || !layer->m_player1) {
+            return;
+        }
+        static bool failedTold = false;
+        if (!buf.ghost1) {
+            buf.ghost1 = makeGhost(layer);
+        }
+        if (!buf.ghost2) {
+            buf.ghost2 = makeGhost(layer);
+        }
+        if (buf.ghost1 && buf.ghost2) {
+            buf.ghostLayerBase = buf.ghostLayer ? buf.ghostLayer->getChildrenCount() : 0;
+            if (!buf.owner) {
+                buf.owner = layer;
+            }
+            failedTold = false;
+            say("ghost players were missing (an old level's cleanup?): rebuilt them");
+        }
+        else if (!failedTold) {
+            failedTold = true;
+            say("ghost players are missing and could not be rebuilt: the buffer cannot predict");
+        }
+    }
+
     void deliverPending(PlayLayer* layer, PlayerObject* player) {
         healGhosts(layer);
         if (buf.autoClicked && ++buf.autoClickAge > st(24)) {
@@ -4485,6 +4532,7 @@ $on_mod(Loaded) {
     buf.console = true;
     ConsoleSink::get().start();
 #endif
+    applyConsoleSettings();
     PipeServer::get().start();
     if (Loader::get()->isModLoaded("syzzi.click_between_frames")) {
         say("Click Between Frames detected: mid-tick sync {}", buf.cbfSync ? "on" : "off");
@@ -4492,7 +4540,7 @@ $on_mod(Loaded) {
     if (Loader::get()->isModLoaded("square3ang.cbfextrapolate")) {
         say("CBF Extrapolate detected: assumed to be visual only (not verified), predictions are not adjusted for it");
     }
-    say("v2.89.0 loaded. The stage key cycles: 0.25f -> 0.5f -> 1f -> 2f -> 4f -> 6f -> 8f -> custom A-D -> off");
+    say("{} loaded. The stage key cycles: 0.25f -> 0.5f -> 1f -> 2f -> 4f -> 6f -> 8f -> custom A-D -> off", Mod::get()->getVersion().toVString());
     if (!importNote.empty()) {
         say("{}", importNote);
     }
@@ -5034,6 +5082,7 @@ namespace {
         }
         readSettings();
         applyStage();
+        applyConsoleSettings();
         buf.showPath = cfg::b("show-path");
         if (!buf.showPath && buf.pathNode) {
             buf.pathNode->clear();
@@ -5090,22 +5139,28 @@ namespace {
         auto& p = PipeServer::get();
         p.send("{\"type\":\"hello\",\"mod\":\"abhyu.input-buffer\",\"name\":\"Testing\",\"version\":" +
             cfg::jstr(Mod::get()->getVersion().toVString()) + ",\"protocol\":1,\"note\":" + cfg::jstr(cfg::config().loadNote()) + "}");
-        p.send(cfg::config().schema());
+        p.send(cfg::config().schema(Mod::get()->getVersion().toVString()));
         sendConfig();
         p.send(buildState());
     }
 
     // The presets the old Buffer menu had.
     void applyPreset(std::string const& name) {
-        bool aggressive = name == "aggressive";
-        bool safe = name == "safe";
+        // v2.88.2: the preset values are the table cfg::PRESETS (same values as before; the app reads the same table)
+        cfg::PresetDef const* preset = nullptr;
+        for (auto const& candidate : cfg::PRESETS) {
+            if (name == candidate.name) {
+                preset = &candidate;
+            }
+        }
+        if (!preset) {
+            return;
+        }
         auto& c = cfg::config();
-        (void)c.set("robust-saves", cfg::Val::boolean(true));
-        (void)c.set("low-latency", cfg::Val::boolean(false));
-        (void)c.set("wave-safety-margin", cfg::Val::boolean(!aggressive));
-        (void)c.set("more-time-death-spots", cfg::Val::boolean(!safe));
-        // Safe = 2f, Balanced = 4f (wave 2f), Aggressive = 8f (the same windows as before the 0.25f stage existed)
-        setStage(safe ? STAGE_2F : aggressive ? STAGE_8F : STAGE_4F);  // resetPending, applyStage, readSettings
+        for (auto const& entry : preset->sets) {
+            (void)c.set(entry.key, cfg::Val::boolean(entry.value));
+        }
+        setStage(preset->stage);  // resetPending, applyStage, readSettings
         onConfigChanged();
         say("preset {}: {}", name, stageText());
     }
@@ -5289,6 +5344,11 @@ $on_mod(Loaded) {
     }
     say("keys (while Geometry Dash is focused): {}", keys);
     say("settings file: {}", (Mod::get()->getSaveDir() / "config.json").string());
+    // v2.88.2: the complete schema next to config.json, so the Testing app always knows this exact version's settings
+    std::string schemaErr;
+    if (!cfg::writeFileAtomic(Mod::get()->getSaveDir() / "schema.json", cfg::config().schema(Mod::get()->getVersion().toVString()) + "\n", &schemaErr)) {
+        say("schema.json could not be written ({})", schemaErr);
+    }
 }
 
 // v2.79 custom TPS (from the v2.80 build): above 240 the level is stepped in 1/tps pieces.

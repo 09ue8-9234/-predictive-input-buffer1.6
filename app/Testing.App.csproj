@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>Testing</AssemblyName>
+    <RootNamespace>TestingApp</RootNamespace>
+    <Version>1.0.0</Version>
+    <Product>Testing (companion app)</Product>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <SelfContained>true</SelfContained>
+    <PublishSingleFile>true</PublishSingleFile>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
+    <DebugType>none</DebugType>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="Assets\groups.json" LogicalName="groups.json" />
+    <!-- written by the workflow from src/cfg.hpp (tools/schema-dump.cpp); a local build without it uses the schema.json the mod writes -->
+    <EmbeddedResource Include="Assets\schema.bundled.json" LogicalName="schema.bundled.json" Condition="Exists('Assets\schema.bundled.json')" />
+  </ItemGroup>
+
+</Project>

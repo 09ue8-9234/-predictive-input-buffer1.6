@@ -27,6 +27,43 @@ namespace cfg {
     constexpr int CUSTOM_MAX_TICKS = 128;  // 32 frames at 60 fps
     constexpr int CUSTOM_MAX_WAVE_TICKS = 64;
 
+    // v2.88.2: data tables the companion app reads (through schema()). main.cpp uses these or checks its own
+    // tables against them at compile time, so the app's schema cannot drift from the mod.
+    struct StageInfo { bool enabled; int ticksAll; int ticksWave; bool custom; int slot; };
+    inline constexpr StageInfo STAGE_TABLE[STAGE_MAX + 1] = {
+        { true, 1, 1, false, -1 },    // 0: 0.25f
+        { true, 2, 2, false, -1 },    // 1: 0.5f
+        { true, 4, 4, false, -1 },    // 2: 1f
+        { true, 8, 8, false, -1 },    // 3: 2f
+        { true, 16, 8, false, -1 },   // 4: 4f, wave 2f
+        { true, 24, 12, false, -1 },  // 5: 6f, wave 3f
+        { true, 32, 16, false, -1 },  // 6: 8f, wave 4f
+        { true, 0, 0, true, 0 },      // 7: custom A
+        { true, 0, 0, true, 1 },      // 8: custom B
+        { true, 0, 0, true, 2 },      // 9: custom C
+        { true, 0, 0, true, 3 },      // 10: custom D
+        { false, 0, 0, false, -1 },   // 11: off
+    };
+    inline constexpr int CUSTOM_SLOT_COUNT = 4;
+    inline constexpr char const* CUSTOM_TICKS_KEYS[CUSTOM_SLOT_COUNT] = { "custom-ticks", "custom-b-ticks", "custom-c-ticks", "custom-d-ticks" };
+    inline constexpr char const* CUSTOM_WAVE_KEYS[CUSTOM_SLOT_COUNT] = { "custom-wave-ticks", "custom-b-wave-ticks", "custom-c-wave-ticks", "custom-d-wave-ticks" };
+    inline constexpr char const* CUSTOM_NAME_KEYS[CUSTOM_SLOT_COUNT] = { "custom-name", "custom-b-name", "custom-c-name", "custom-d-name" };
+    // Settings that are remembered per level when 'per-level-settings' is on (the values live in the game's own save, not in config.json)
+    inline constexpr char const* PROFILE_KEYS[] = { "robust-saves", "orb-align", "orb-timing", "level-memory",
+        "more-time-death-spots", "ship-buffer", "ufo-smart", "ball-smart", "swing-smart", "cbf-sync", "predict-moving-objects",
+        "training-mode" };
+    struct PresetSet { char const* key; bool value; };
+    struct PresetDef { char const* name; int stage; char const* info; PresetSet sets[4]; };
+    inline constexpr int PRESET_COUNT = 3;
+    inline constexpr PresetDef PRESETS[PRESET_COUNT] = {
+        { "safe", 3, "2f window. Robust saves and wave margin on, MORE TIME off, low latency off.",
+          { { "robust-saves", true }, { "low-latency", false }, { "wave-safety-margin", true }, { "more-time-death-spots", false } } },
+        { "balanced", 4, "4f window (wave 2f). Robust saves, wave margin and MORE TIME on, low latency off.",
+          { { "robust-saves", true }, { "low-latency", false }, { "wave-safety-margin", true }, { "more-time-death-spots", true } } },
+        { "aggressive", 6, "8f window (wave 4f). Robust saves and MORE TIME on, wave margin off, low latency off.",
+          { { "robust-saves", true }, { "low-latency", false }, { "wave-safety-margin", false }, { "more-time-death-spots", true } } },
+    };
+
     // ---------- tiny flat-JSON reader / writer ----------
     struct Val {
         enum T { None, Bool, Num, Str } t = None;
@@ -313,6 +350,8 @@ namespace cfg {
         if (setting == "show-tps-text") return "Ctrl+F8";
         if (setting == "show-watermark") return "Ctrl+F9";
         if (setting == "show-complete-label") return "Ctrl+F10";
+        if (setting == "console-link") return "Ctrl+F5";      // v2.88.2 (Ctrl+F4 is 'unlimited-delay')
+        if (setting == "console-window") return "Shift+F5";   // v2.88.2
         if (setting == "unlimited-delay") return "Ctrl+F4";
         return "";
     }
@@ -401,11 +440,13 @@ namespace cfg {
         {"fix-training-auto", Kind::Bool, 0, 0, 0, "", R"~(Fix: no auto inputs in training mode: In training mode, auto-release and auto-click stay off, so training never touches your inputs. Off by default.)~"},
         {"fix-mover-conflict", Kind::Bool, 0, 0, 0, "", R"~(Fix: movers conflict: If 'Predict moving objects' and 'Don't buffer near moving objects' are both on, predict wins and the other is ignored (they work against each other). Off by default.)~"},
         {"fix-auto-throttle", Kind::Bool, 0, 0, 0, "", R"~(Fix: auto-input throttle: After an auto-release or auto-click check took longer than the prediction time budget, the next checks wait about 1 frame (4 ticks). Cheap checks are never delayed. Off by default.)~"},
-        {"unlimited-delay", Kind::Bool, 0, 0, 0, "", R"~(Unlimited delay (no cap): Removes the stage's cap on how EARLY an input may be: an early click or release is held back tick by tick until the first timing whose path survives (up to 100 seconds). The stage then only matters as on / off. Searching is still limited by the prediction time budget, so a very early input may not be reached; raise 'Prediction time budget' for that. While this is on, 'Auto time budget' no longer cuts the budget to one frame (the budget setting is used as it is, so very early inputs can cost frame time). Since v2.89 it also makes the ghost look twice as far ahead in every mode (cube / ball / spider 130 -> 260 ticks, wave 65 -> 130, ship / ufo / swing 48 -> 96) and doubles the ship's own max delay (up to 32 ticks); a farther look-ahead sees more obstacles and costs more time per click. Off by default.)~"},
+        {"unlimited-delay", Kind::Bool, 0, 0, 0, "", R"~(Unlimited delay (no cap): Removes the stage's cap on how EARLY an input may be: an early click or release is held back tick by tick until the first timing whose path survives (up to 100 seconds). The stage then only matters as on / off. Searching is still limited by the prediction time budget, so a very early input may not be reached; raise 'Prediction time budget' for that. While this is on, 'Auto time budget' no longer cuts the budget to one frame (the budget setting is used as it is, so very early inputs can cost frame time). Ship keeps its own limit unless 'Ship: use the stage's delay' is on. Off by default.)~"},
         {"ship-uses-stage", Kind::Bool, 1, 0, 0, "", R"~(Ship: use the stage's delay: The ship may use the stage's max delay (or unlimited delay) like every other mode, but never less than 'Ship: max delay'. Off = the ship only uses its own small limit. Below the 1f stage nothing changes. On by default.)~"},
         {"orb-press-passthrough", Kind::Bool, 1, 0, 0, "", R"~(Orb press passes through: A press that already touches an orb is your own orb hit and goes to the game unchanged, even if the prediction dislikes the path. Never when an earlier input is still waiting (the order is kept). Also, a press whose timing already activates an orb is never re-timed by orb alignment. Off = the old behaviour (orb timing may re-time a press inside an orb). On by default.)~"},
         {"orb-same-target", Kind::Bool, 1, 0, 0, "", R"~(Orb alignment: same orb only: A timing only counts if it activates the FIRST orb ahead, not another one further along, and a learned timing is only used for that orb. Applies to the fully safe pick and to the fallback pick (crashing clearly latest). Off = any orb counts. On by default.)~"},
         {"inverted-wave", Kind::Bool, 1, 0, 0, "", R"~(Upside-down wave rules: In an upside-down wave the corridors need quicker turns: the spam gap is at most 1.5 frames, a turn must come at least 3 frames after the input to count, the turn must survive 6 frames, and a save must be fully safe instead of only clearly better. Off = the normal wave rules. On by default.)~"},
+        {"console-link", Kind::Bool, 1, 0, 0, "", R"~(Console link (named pipe): Lets the Testing app (or tools/pipe-test.ps1) connect to the game over the named pipe. Off closes the pipe, so nothing can connect and a connected app loses its connection; key presses still work. Ctrl+F5 switches it while the game is focused. On by default.)~"},
+        {"console-window", Kind::Bool, 1, 0, 0, "", R"~(Console window: Shows the live console window that opens with the game. Off hides it (the log keeps running). Shift+F5 switches it while the game is focused. On by default.)~"},
             };
             std::vector<Spec> out(v.begin(), v.end());
             for (auto const& a : actions()) {
@@ -504,7 +545,9 @@ namespace cfg {
             std::lock_guard lock(m_mutex);
             return dumpLocked(true);
         }
-        std::string schema() const {
+        // v2.88.2: also carries the stage table, presets, custom slot keys and per-level keys, plus the mod version
+        // when given. The companion app bundles this (schema-dump) and the mod writes it to schema.json at load.
+        std::string schema(std::string const& modVersion = std::string()) const {
             std::string o = "{\"type\":\"schema\",\"settings\":[";
             bool first = true;
             for (auto const& sp : specs()) {
@@ -516,11 +559,47 @@ namespace cfg {
                 else o += ",\"default\":" + jnum(sp.def) + ",\"min\":" + jnum(sp.lo) + ",\"max\":" + jnum(sp.hi);
                 o += ",\"info\":" + jstr(sp.info) + "}";
             }
-            return o + "],\"actions\":[" + [] {
-                std::string a;
-                for (auto const& x : actions()) { if (!a.empty()) a += ','; a += "{\"name\":" + jstr(x.name) + ",\"info\":" + jstr(x.info) + "}"; }
-                return a;
-            }() + "]}";
+            o += "],\"actions\":[";
+            first = true;
+            for (auto const& x : actions()) {
+                if (!first) o += ',';
+                first = false;
+                o += "{\"name\":" + jstr(x.name) + ",\"info\":" + jstr(x.info) + "}";
+            }
+            o += "],\"configVersion\":" + std::to_string(CONFIG_VERSION) + ",\"stageMax\":" + std::to_string(STAGE_MAX) +
+                 ",\"customMaxTicks\":" + std::to_string(CUSTOM_MAX_TICKS) + ",\"customMaxWaveTicks\":" + std::to_string(CUSTOM_MAX_WAVE_TICKS);
+            if (!modVersion.empty()) o += ",\"modVersion\":" + jstr(modVersion);
+            o += ",\"stages\":[";
+            for (int i = 0; i <= STAGE_MAX; ++i) {
+                auto const& st = STAGE_TABLE[i];
+                if (i) o += ',';
+                o += "{\"stage\":" + std::to_string(i) + ",\"enabled\":" + (st.enabled ? "true" : "false") + ",\"ticks\":" + std::to_string(st.ticksAll) +
+                     ",\"waveTicks\":" + std::to_string(st.ticksWave) + ",\"custom\":" + (st.custom ? "true" : "false") + ",\"slot\":" + std::to_string(st.slot) + "}";
+            }
+            o += "],\"customSlots\":[";
+            for (int i = 0; i < CUSTOM_SLOT_COUNT; ++i) {
+                if (i) o += ',';
+                o += "{\"slot\":" + std::to_string(i) + ",\"letter\":" + jstr(std::string(1, static_cast<char>('A' + i))) +
+                     ",\"stage\":" + std::to_string(STAGE_MAX - CUSTOM_SLOT_COUNT + i) + ",\"ticksKey\":" + jstr(CUSTOM_TICKS_KEYS[i]) +
+                     ",\"waveKey\":" + jstr(CUSTOM_WAVE_KEYS[i]) + ",\"nameKey\":" + jstr(CUSTOM_NAME_KEYS[i]) + "}";
+            }
+            o += "],\"presets\":[";
+            for (int i = 0; i < PRESET_COUNT; ++i) {
+                auto const& pr = PRESETS[i];
+                if (i) o += ',';
+                o += "{\"name\":" + jstr(pr.name) + ",\"stage\":" + std::to_string(pr.stage) + ",\"info\":" + jstr(pr.info) + ",\"set\":{";
+                for (int k = 0; k < 4; ++k) {
+                    if (k) o += ',';
+                    o += jstr(pr.sets[k].key) + ":" + (pr.sets[k].value ? "true" : "false");
+                }
+                o += "}}";
+            }
+            o += "],\"perLevel\":[";
+            for (size_t i = 0; i < sizeof(PROFILE_KEYS) / sizeof(PROFILE_KEYS[0]); ++i) {
+                if (i) o += ',';
+                o += jstr(PROFILE_KEYS[i]);
+            }
+            return o + "]}";
         }
 
     private:

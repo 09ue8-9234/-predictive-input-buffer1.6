@@ -12,12 +12,6 @@ namespace prediction_policy {
     // bounded by the prediction time budget; this only removes the stage's cap.
     constexpr int UNLIMITED_TICKS = 24000;
 
-    // v2.89: with "unlimited-delay" on, every mode looks twice as far ahead as it normally does (cube / ball /
-    // spider 130 -> 260 ticks, wave 65 -> 130, ship / ufo / swing 48 -> 96). `normal` is the st()-scaled value.
-    constexpr int lookAheadTicks(bool unlimited, int normal) {
-        return unlimited ? normal * 2 : normal;
-    }
-
     // A press that already touches an orb is the player's own orb hit: it goes to the game unchanged,
     // but never past a delay that is still waiting (that would reorder the inputs).
     constexpr bool passOrbPress(bool enabled, bool down, bool touchingOrb, bool queueEmpty) {
@@ -42,12 +36,12 @@ namespace prediction_policy {
     }
 
     // Longest delay in ticks (before st() scaling) for the mode being played. `unlimited` removes the
-    // cap for cube / wave / etc.; the ship keeps its own limit (clamped 0..16, doubled to 0..32 while unlimited
-    // is on, v2.89) unless `shipUsesStage`, in which case it may also use the stage's delay (never less than its own).
+    // stage's cap for cube / wave / etc.; the ship keeps its own limit (clamped 0..16) unless
+    // `shipUsesStage`, in which case it may also use the stage's delay (never less than its own).
     constexpr int maxDelayTicks(bool anyWave, bool anyShip, bool unlimited, bool shipUsesStage, int stageAll, int stageWave, int shipMax) {
         int all = unlimited ? UNLIMITED_TICKS : stageAll;
         int wave = unlimited ? UNLIMITED_TICKS : stageWave;
-        int ship = unlimited ? std::clamp(shipMax * 2, 0, 32) : std::clamp(shipMax, 0, 16);
+        int ship = std::clamp(shipMax, 0, 16);
         if (shipUsesStage) {
             ship = std::max(ship, all);
         }

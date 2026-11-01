@@ -1,0 +1,15 @@
+{
+  "note": "Rules only (regular expressions on the setting key), not a list of settings. The first matching group wins; unmatched settings land in the fallback group, so new settings show up by themselves.",
+  "groups": [
+    { "name": "Fixes", "sort": 70, "blurb": "Behaviour fixes. Each one is a switch you can turn on or off on its own.", "match": ["^fix-"] },
+    { "name": "Display", "sort": 80, "blurb": "What the mod draws or plays inside the game. Everything is off by default.", "match": ["^show-", "^death-heatmap$", "^save-ding$"] },
+    { "name": "Console and debug", "sort": 90, "blurb": "The console link and window, and debug logging.", "match": ["^console-", "^drift-check$", "^perf-log$", "^death-log$", "^explain-inputs$"] },
+    { "name": "Auto-release and auto-click", "sort": 30, "blurb": "The mod lets go or clicks for you when it is clearly safe.", "match": ["auto-release", "auto-click"] },
+    { "name": "Moving objects", "sort": 40, "blurb": "How the prediction deals with objects that move.", "match": ["moving-objects"] },
+    { "name": "Prediction", "sort": 20, "blurb": "How far and how carefully the ghost looks ahead, per game mode.", "match": ["^sim-budget", "^smart-prediction$", "horizon$", "^full-ghost", "^predict-", "^robust-saves$", "^ignore-touching", "^cube-late", "^cbf-sync$", "^level-memory$", "^more-time", "-smart$", "^ship-", "^wave-", "^orb-", "^auto-budget$"] },
+    { "name": "Modes and performance", "sort": 50, "blurb": "Training, low latency, performance and per-level behaviour.", "match": ["^low-latency$", "^performance-mode$", "^training-mode$", "^practice-only$", "^tps$", "^per-level-settings$"] }
+  ],
+  "fallback": { "name": "More settings", "sort": 60, "blurb": "Settings the app has no group rule for yet." },
+  "hidden": ["^config-version$"],
+  "buffer": ["^stage$", "^custom-"]
+}
