@@ -1,4 +1,4 @@
-// Testing (id abhyu.input-buffer) v2.88.2: Click Before Frames engine, no in-game UI. All settings live in config.json (cfg.hpp) and are driven from an external console over a named pipe.
+// Testing (id abhyu.input-buffer) v2.88.3: Click Before Frames engine, no in-game UI. All settings live in config.json (cfg.hpp) and are driven from an external console over a named pipe.
 //
 // When you click (or release, in wave / robot), a hidden "ghost" player is simulated
 // ahead with your input. If the ghost dies, the input is retried with 1..N ticks of
@@ -166,7 +166,7 @@ namespace {
                   FIRST_CUSTOM_STAGE + CUSTOM_SLOTS == STAGE_OFF && !STAGES[FIRST_CUSTOM_STAGE - 1].custom,
         "custom slots sit right before the off stage");
     static_assert(cfg::STAGE_DEFAULT == STAGE_05F, "a fresh install starts on 0.5f");
-    // v2.88.2: the key tables and the stage / preset data live in cfg.hpp (the companion app reads them from there);
+    // v2.88.3: the key tables and the stage / preset data live in cfg.hpp (the companion app reads them from there);
     // the checks below break the build if this file and cfg.hpp ever disagree.
     static_assert(cfg::CUSTOM_SLOT_COUNT == CUSTOM_SLOTS, "custom slot count must match cfg.hpp");
     constexpr auto& CUSTOM_TICKS_KEY = cfg::CUSTOM_TICKS_KEYS;
@@ -493,7 +493,7 @@ namespace {
             return *p;
         }
         bool connected() const { return m_connected.load(); }
-    // v2.88.2: console link switch (setting 'console-link'); off = the pipe is closed, nothing can connect
+    // v2.88.3: console link switch (setting 'console-link'); off = the pipe is closed, nothing can connect
     void setEnabled(bool on) { m_enabled = on; }
     bool enabled() const { return m_enabled.load(); }
         bool takeHello() { return m_hello.exchange(false); }
@@ -688,7 +688,7 @@ namespace {
 
     private:
 #ifdef GEODE_IS_WINDOWS
-        // v2.88.2: the pipe only exists while the 'console-link' setting is on (default on). Switching it off closes
+        // v2.88.3: the pipe only exists while the 'console-link' setting is on (default on). Switching it off closes
         // the pipe handle, so nothing can connect and a connected app is dropped. If the pipe can't be created
         // (name still taken, no rights...), try again with a growing pause (1 s, 2 s ... 30 s) instead of giving up
         // for the whole session. The game thread tells the player once when it fails and once when it works.
@@ -882,7 +882,7 @@ namespace {
         std::deque<Cmd> m_cmds;
         std::deque<std::string> m_out;
     };
-    // v2.88.2: console link (the pipe) and console window switches; both default ON = how it always was.
+    // v2.88.3: console link (the pipe) and console window switches; both default ON = how it always was.
     void applyConsoleSettings() {
         PipeServer::get().setEnabled(cfg::b("console-link"));
 #ifdef GEODE_IS_WINDOWS
@@ -3331,7 +3331,7 @@ namespace {
     // v2.51 per-level settings: your switches (v2.59: not the stage, not low latency) are remembered for each level and
     // come back when you open it again. Outside a level (and in levels you haven't changed
     // anything in) the normal settings apply.
-    constexpr auto& PROFILE_KEYS = cfg::PROFILE_KEYS;  // v2.88.2: the list lives in cfg.hpp (the app shows which settings are per level)
+    constexpr auto& PROFILE_KEYS = cfg::PROFILE_KEYS;  // v2.88.3: the list lives in cfg.hpp (the app shows which settings are per level)
 
     struct Globals {
         bool have = false;
@@ -3507,6 +3507,34 @@ namespace {
             text += "Run check: " + lastBench + "\n";
         }
         return text;
+    }
+
+    // v2.88.1: the ghost players are missing while the mod is on (an old level's cleanup ran after the new
+    // level started, or creating them failed). simulate() answers "fully safe" without ghosts, so the
+    // buffer silently stopped until the next level load. Rebuild them, and say so once per rebuild.
+    void healGhosts(PlayLayer* layer) {
+        if ((buf.ghost1 && buf.ghost2) || buf.simulating || !layer || !layer->m_player1) {
+            return;
+        }
+        static bool failedTold = false;
+        if (!buf.ghost1) {
+            buf.ghost1 = makeGhost(layer);
+        }
+        if (!buf.ghost2) {
+            buf.ghost2 = makeGhost(layer);
+        }
+        if (buf.ghost1 && buf.ghost2) {
+            buf.ghostLayerBase = buf.ghostLayer ? buf.ghostLayer->getChildrenCount() : 0;
+            if (!buf.owner) {
+                buf.owner = layer;
+            }
+            failedTold = false;
+            say("ghost players were missing (an old level's cleanup?): rebuilt them");
+        }
+        else if (!failedTold) {
+            failedTold = true;
+            say("ghost players are missing and could not be rebuilt: the buffer cannot predict");
+        }
     }
 
     bool intercept(GJBaseGameLayer* self, bool down, bool isPlayer1) {
@@ -4262,34 +4290,6 @@ namespace {
         sendButton(layer, true);
         queueInput(hold, false);
         say("AUTO click{}: doing nothing dies in {}t, clicking (hold {}t) is safe", robot ? " (robot)" : "", idle, hold);
-    }
-
-    // v2.88.1: the ghost players are missing while the mod is on (an old level's cleanup ran after the new
-    // level started, or creating them failed). simulate() answers "fully safe" without ghosts, so the
-    // buffer silently stopped until the next level load. Rebuild them, and say so once per rebuild.
-    void healGhosts(PlayLayer* layer) {
-        if ((buf.ghost1 && buf.ghost2) || buf.simulating || !layer || !layer->m_player1) {
-            return;
-        }
-        static bool failedTold = false;
-        if (!buf.ghost1) {
-            buf.ghost1 = makeGhost(layer);
-        }
-        if (!buf.ghost2) {
-            buf.ghost2 = makeGhost(layer);
-        }
-        if (buf.ghost1 && buf.ghost2) {
-            buf.ghostLayerBase = buf.ghostLayer ? buf.ghostLayer->getChildrenCount() : 0;
-            if (!buf.owner) {
-                buf.owner = layer;
-            }
-            failedTold = false;
-            say("ghost players were missing (an old level's cleanup?): rebuilt them");
-        }
-        else if (!failedTold) {
-            failedTold = true;
-            say("ghost players are missing and could not be rebuilt: the buffer cannot predict");
-        }
     }
 
     void deliverPending(PlayLayer* layer, PlayerObject* player) {
@@ -5146,7 +5146,7 @@ namespace {
 
     // The presets the old Buffer menu had.
     void applyPreset(std::string const& name) {
-        // v2.88.2: the preset values are the table cfg::PRESETS (same values as before; the app reads the same table)
+        // v2.88.3: the preset values are the table cfg::PRESETS (same values as before; the app reads the same table)
         cfg::PresetDef const* preset = nullptr;
         for (auto const& candidate : cfg::PRESETS) {
             if (name == candidate.name) {
@@ -5344,7 +5344,7 @@ $on_mod(Loaded) {
     }
     say("keys (while Geometry Dash is focused): {}", keys);
     say("settings file: {}", (Mod::get()->getSaveDir() / "config.json").string());
-    // v2.88.2: the complete schema next to config.json, so the Testing app always knows this exact version's settings
+    // v2.88.3: the complete schema next to config.json, so the Testing app always knows this exact version's settings
     std::string schemaErr;
     if (!cfg::writeFileAtomic(Mod::get()->getSaveDir() / "schema.json", cfg::config().schema(Mod::get()->getVersion().toVString()) + "\n", &schemaErr)) {
         say("schema.json could not be written ({})", schemaErr);

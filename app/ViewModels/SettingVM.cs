@@ -11,6 +11,7 @@ public sealed class SettingVM : Obs
 
     public SettingSpec Spec { get; }
     public ICommand ResetCommand { get; }
+    public ICommand SetNumCommand { get; }   // used by the sliders: only user changes arrive here
 
     public SettingVM(SettingSpec spec, MainVM host)
     {
@@ -18,6 +19,7 @@ public sealed class SettingVM : Obs
         _host = host;
         _value = spec.Default;
         ResetCommand = new RelayCommand(_ => Commit(Spec.Default), _ => CanEdit);
+        SetNumCommand = new RelayCommand(p => { if (p is double d && Math.Abs(d - NumValue) > 1e-9) NumValue = d; });
         host.PropertyChanged += (_, e) =>
         {
             if (e.PropertyName == nameof(MainVM.CanEdit)) Raise(nameof(CanEdit));

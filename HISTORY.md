@@ -1,12 +1,15 @@
 # History
 
-## v2.88.2 (Testing app 1.0.0)
-Additive changes for the companion app. With the two new settings left on (their defaults) the behaviour is exactly v2.88.1.
+## v2.88.3 (Testing app 1.0.0)
+Additive changes for the companion app. With the two new settings left on (their defaults) the behaviour is exactly v2.88.2.
 - New `console-link` (on, Ctrl+F5): the named pipe is closed while it is off. New `console-window` (on, Shift+F5): hides / shows the console window. (Ctrl+F4 is taken by `unlimited-delay`.)
 - The mod writes `schema.json` next to `config.json` at load. The `schema` message and that file now also carry the config version, the stage table, the presets, the custom slot keys, the per-level keys and the mod version (new fields at the end).
 - `cfg.hpp` now holds the stage table, the custom slot key lists, `PROFILE_KEYS` and the preset values (`PRESETS`). `main.cpp` uses the lists and presets from there and checks its STAGES table against it at compile time. Preset values are unchanged.
 - The startup line shows the real mod version.
-- New `tools/schema-dump.cpp` (builds the schema from `cfg.hpp` for the app) and the `app/` folder: Testing app 1.0.0 (C# WPF, one exe built by the GitHub workflow).
+- New `tools/schema-dump.cpp` (builds the schema from `cfg.hpp` for the app) and the `app/` folder: Testing app 1.0.0 (C# WPF, one exe built by the GitHub workflow, artifact "Testing App").
+
+## v2.88.2
+- Build fix: v2.88.1 did not compile (`healGhosts` was defined after the place that calls it). It is now defined before `intercept`. No behaviour change from v2.88.1.
 
 ## v2.88.1
 - Fix: the buffer could silently stop working until the next level load. The mod's state is shared by every level, and a level's quit cleanup (`onQuit`) tore it down even when a different level had already taken it over, deleting that level's ghost players; without ghosts every prediction answers "safe" and every input passes through. A quitting level now leaves the state alone when another level owns it, and if the ghost players are ever missing while the mod is on they are rebuilt (one console line: "ghost players were missing ... rebuilt them", or "could not be rebuilt").

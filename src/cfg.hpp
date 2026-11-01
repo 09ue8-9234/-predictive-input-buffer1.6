@@ -27,7 +27,7 @@ namespace cfg {
     constexpr int CUSTOM_MAX_TICKS = 128;  // 32 frames at 60 fps
     constexpr int CUSTOM_MAX_WAVE_TICKS = 64;
 
-    // v2.88.2: data tables the companion app reads (through schema()). main.cpp uses these or checks its own
+    // v2.88.3: data tables the companion app reads (through schema()). main.cpp uses these or checks its own
     // tables against them at compile time, so the app's schema cannot drift from the mod.
     struct StageInfo { bool enabled; int ticksAll; int ticksWave; bool custom; int slot; };
     inline constexpr StageInfo STAGE_TABLE[STAGE_MAX + 1] = {
@@ -350,8 +350,8 @@ namespace cfg {
         if (setting == "show-tps-text") return "Ctrl+F8";
         if (setting == "show-watermark") return "Ctrl+F9";
         if (setting == "show-complete-label") return "Ctrl+F10";
-        if (setting == "console-link") return "Ctrl+F5";      // v2.88.2 (Ctrl+F4 is 'unlimited-delay')
-        if (setting == "console-window") return "Shift+F5";   // v2.88.2
+        if (setting == "console-link") return "Ctrl+F5";      // v2.88.3 (Ctrl+F4 is 'unlimited-delay')
+        if (setting == "console-window") return "Shift+F5";   // v2.88.3
         if (setting == "unlimited-delay") return "Ctrl+F4";
         return "";
     }
@@ -445,8 +445,8 @@ namespace cfg {
         {"orb-press-passthrough", Kind::Bool, 1, 0, 0, "", R"~(Orb press passes through: A press that already touches an orb is your own orb hit and goes to the game unchanged, even if the prediction dislikes the path. Never when an earlier input is still waiting (the order is kept). Also, a press whose timing already activates an orb is never re-timed by orb alignment. Off = the old behaviour (orb timing may re-time a press inside an orb). On by default.)~"},
         {"orb-same-target", Kind::Bool, 1, 0, 0, "", R"~(Orb alignment: same orb only: A timing only counts if it activates the FIRST orb ahead, not another one further along, and a learned timing is only used for that orb. Applies to the fully safe pick and to the fallback pick (crashing clearly latest). Off = any orb counts. On by default.)~"},
         {"inverted-wave", Kind::Bool, 1, 0, 0, "", R"~(Upside-down wave rules: In an upside-down wave the corridors need quicker turns: the spam gap is at most 1.5 frames, a turn must come at least 3 frames after the input to count, the turn must survive 6 frames, and a save must be fully safe instead of only clearly better. Off = the normal wave rules. On by default.)~"},
-        {"console-link", Kind::Bool, 1, 0, 0, "", R"~(Console link (named pipe): Lets the Testing app (or tools/pipe-test.ps1) connect to the game over the named pipe. Off closes the pipe, so nothing can connect and a connected app loses its connection; key presses still work. Ctrl+F5 switches it while the game is focused. On by default.)~"},
-        {"console-window", Kind::Bool, 1, 0, 0, "", R"~(Console window: Shows the live console window that opens with the game. Off hides it (the log keeps running). Shift+F5 switches it while the game is focused. On by default.)~"},
+        {"console-link", Kind::Bool, 1, 0, 0, "", R"~(Console link (named pipe): ON: the Testing app (or tools/pipe-test.ps1) can connect to the game over the named pipe. OFF: the pipe is closed and nothing can connect; an app that is connected loses its connection. Keys still work. Ctrl+F5 switches it while the game is focused. On by default.)~"},
+        {"console-window", Kind::Bool, 1, 0, 0, "", R"~(Console window: Shows the live console window that opens with the game. OFF hides it (the log keeps running). Shift+F5 switches it while the game is focused. On by default.)~"},
             };
             std::vector<Spec> out(v.begin(), v.end());
             for (auto const& a : actions()) {
@@ -545,7 +545,7 @@ namespace cfg {
             std::lock_guard lock(m_mutex);
             return dumpLocked(true);
         }
-        // v2.88.2: also carries the stage table, presets, custom slot keys and per-level keys, plus the mod version
+        // v2.88.3: also carries the stage table, presets, custom slot keys and per-level keys, plus the mod version
         // when given. The companion app bundles this (schema-dump) and the mod writes it to schema.json at load.
         std::string schema(std::string const& modVersion = std::string()) const {
             std::string o = "{\"type\":\"schema\",\"settings\":[";

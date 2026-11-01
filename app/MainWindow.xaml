@@ -46,9 +46,9 @@
                             <ColumnDefinition Width="*" />
                             <ColumnDefinition Width="Auto" />
                         </Grid.ColumnDefinitions>
-                        <Slider Style="{StaticResource BlueSlider}" Minimum="{Binding Min}" Maximum="{Binding Max}"
+                        <ctl:CommitSlider Style="{StaticResource BlueSlider}" Minimum="{Binding Min}" Maximum="{Binding Max}"
                                 TickFrequency="{Binding Step}" IsSnapToTickEnabled="True"
-                                Value="{Binding NumValue, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                                Value="{Binding NumValue, Mode=OneWay}" CommitCommand="{Binding SetNumCommand}" />
                         <TextBox Grid.Column="1" Style="{StaticResource CommitBox}" Width="80" Margin="14,0,0,0" HorizontalContentAlignment="Center"
                                  Text="{Binding NumText, Mode=TwoWay, UpdateSourceTrigger=LostFocus}" />
                     </Grid>
@@ -89,8 +89,8 @@
                                 <ColumnDefinition Width="*" />
                                 <ColumnDefinition Width="190" />
                             </Grid.ColumnDefinitions>
-                            <Slider Style="{StaticResource BlueSlider}" Minimum="{Binding Ticks.Min}" Maximum="{Binding Ticks.Max}" TickFrequency="1" IsSnapToTickEnabled="True"
-                                    Value="{Binding Ticks.NumValue, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                            <ctl:CommitSlider Style="{StaticResource BlueSlider}" Minimum="{Binding Ticks.Min}" Maximum="{Binding Ticks.Max}" TickFrequency="1" IsSnapToTickEnabled="True"
+                                    Value="{Binding Ticks.NumValue, Mode=OneWay}" CommitCommand="{Binding Ticks.SetNumCommand}" />
                             <TextBlock Grid.Column="1" Text="{Binding TicksLabel}" Margin="14,0,0,0" VerticalAlignment="Center" FontWeight="SemiBold" />
                         </Grid>
                         <Grid Margin="0,6,0,0">
@@ -98,8 +98,8 @@
                                 <ColumnDefinition Width="*" />
                                 <ColumnDefinition Width="190" />
                             </Grid.ColumnDefinitions>
-                            <Slider Style="{StaticResource BlueSlider}" Minimum="{Binding Wave.Min}" Maximum="{Binding Wave.Max}" TickFrequency="1" IsSnapToTickEnabled="True"
-                                    Value="{Binding Wave.NumValue, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                            <ctl:CommitSlider Style="{StaticResource BlueSlider}" Minimum="{Binding Wave.Min}" Maximum="{Binding Wave.Max}" TickFrequency="1" IsSnapToTickEnabled="True"
+                                    Value="{Binding Wave.NumValue, Mode=OneWay}" CommitCommand="{Binding Wave.SetNumCommand}" />
                             <TextBlock Grid.Column="1" Text="{Binding WaveLabel}" Margin="14,0,0,0" VerticalAlignment="Center" Foreground="{StaticResource MutedBrush}" />
                         </Grid>
                     </StackPanel>
