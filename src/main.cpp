@@ -1,4 +1,4 @@
-// Testing (id abhyu.input-buffer) v2.88.2: Click Before Frames engine, no in-game UI. All settings live in config.json (cfg.hpp) and are driven from an external console over a named pipe.
+// Testing (id abhyu.input-buffer) v2.89.0: Click Before Frames engine, no in-game UI. All settings live in config.json (cfg.hpp) and are driven from an external console over a named pipe.
 //
 // When you click (or release, in wave / robot), a hidden "ghost" player is simulated
 // ahead with your input. If the ghost dies, the input is retried with 1..N ticks of
@@ -2385,6 +2385,12 @@ namespace {
         return st(mini ? std::max(20, wh - 15) : wh);  // v4.6: 65 normal / 50 mini
     }
 
+    // v2.89: with unlimited-delay on, every mode looks 128 frames (512 ticks) ahead instead of its normal
+    // look-ahead (`normal` is already st() scaled). Off = the normal look-ahead, unchanged.
+    int lookAhead(int normal) {
+        return prediction_policy::lookAheadTicks(buf.unlimitedDelay, normal, st(prediction_policy::UNLIMITED_LOOKAHEAD_TICKS));
+    }
+
     // v2.6 orb alignment: a press made a little before reaching an orb would be wasted
     // (or jump off the ground instead). Find the delay that lands the press inside the
     // orb, like the cube buffer does for jumps. Returns that delay, or 0.
@@ -3183,7 +3189,7 @@ namespace {
         if (!buf.showPath || buf.perfMode || !buf.pathNode || !buf.ghost1 || buf.simulating || p1->m_isDead || layer->m_isPlatformer) {
             return;
         }
-        if (tickCount < buf.pathHoldUntil || !buf.queue.empty() || tickCount % st(12) != 0) {
+        if (tickCount < buf.pathHoldUntil || !buf.queue.empty() || tickCount % st(buf.unlimitedDelay ? 48 : 12) != 0) {
             return;
         }
         bool twoPlayer = layer->m_level && layer->m_level->m_twoPlayerMode;
@@ -3193,7 +3199,7 @@ namespace {
         bool ship = p1->m_isShip || (p2 && p2->m_isShip);
         bool flyer = isFlying(p1) || (p2 && isFlying(p2));
         bool mini = (p1->m_isDart && p1->m_vehicleSize < 1.f) || (p2 && p2->m_isDart && p2->m_vehicleSize < 1.f);
-        int horizon = wave ? fullWaveHorizon(mini) : st(flyer ? 48 : std::clamp(buf.groundHorizon, 48, 240));
+        int horizon = lookAhead(wave ? fullWaveHorizon(mini) : st(flyer ? 48 : std::clamp(buf.groundHorizon, 48, 240)));  // v2.89
         bool down = !buf.appliedInput;
         int releaseAfter = down && !wave && !ship ? holdEstimate() : -1;
 
@@ -3697,6 +3703,7 @@ namespace {
         if (anyWave) {
             horizon = fullWaveHorizon(mini);
         }
+        horizon = lookAhead(horizon);  // v2.89: unlimited-delay looks 128 frames ahead in every mode
         // v2.88: unlimited-delay removes the stage's cap; ship-uses-stage lets the ship follow the stage
         int maxDelay = st(prediction_policy::maxDelayTicks(anyWave, anyShip, buf.unlimitedDelay, buf.shipUsesStage,
             buf.ticksAll, buf.ticksWave, buf.shipMaxDelay));
@@ -3845,7 +3852,7 @@ namespace {
                 // v2.67: wave / ship input that's already safe (if you keep reacting) is held back
                 // at most 1 frame here. Up to 4f (16t) made fast zigzags at death spots feel late:
                 // every later click in the rhythm gets shifted by the same amount.
-                int moreMax = (cubeStyleWave || shipInput) ? std::min(maxDelay, st(4)) : maxDelay;
+                int moreMax = (cubeStyleWave || shipInput) && !buf.unlimitedDelay ? std::min(maxDelay, st(4)) : maxDelay;  // v2.89: unlimited lifts the 1f cap
                 for (int k = 1; k <= moreMax; ++k) {
                     SimEnd e;
                     if (clickOverTime()) {
@@ -4485,7 +4492,7 @@ $on_mod(Loaded) {
     if (Loader::get()->isModLoaded("square3ang.cbfextrapolate")) {
         say("CBF Extrapolate detected: assumed to be visual only (not verified), predictions are not adjusted for it");
     }
-    say("v2.88.2 loaded. The stage key cycles: 0.25f -> 0.5f -> 1f -> 2f -> 4f -> 6f -> 8f -> custom A-D -> off");
+    say("v2.89.0 loaded. The stage key cycles: 0.25f -> 0.5f -> 1f -> 2f -> 4f -> 6f -> 8f -> custom A-D -> off");
     if (!importNote.empty()) {
         say("{}", importNote);
     }

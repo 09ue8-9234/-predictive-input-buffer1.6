@@ -45,9 +45,20 @@ int main() {
     CHECK(maxDelayTicks(false, true, false, true, 2, 2, 4) == 4);            // ...but never below its own delay
     CHECK(maxDelayTicks(false, false, true, false, 8, 8, 4) == UNLIMITED_TICKS);
     CHECK(maxDelayTicks(true, false, true, false, 8, 0, 4) == UNLIMITED_TICKS);   // wave off in the stage: unlimited wins
-    CHECK(maxDelayTicks(false, true, true, false, 8, 8, 4) == 4);            // unlimited alone doesn't change ship
+    CHECK(maxDelayTicks(false, true, true, false, 8, 8, 4) == UNLIMITED_TICKS);   // v2.89: unlimited includes the ship
+    CHECK(maxDelayTicks(false, true, false, false, 8, 8, 4) == 4);           // unlimited off: ship keeps its own cap
     CHECK(maxDelayTicks(false, true, true, true, 8, 8, 4) == UNLIMITED_TICKS);    // ship follows unlimited
     CHECK(maxDelayTicks(false, false, false, false, 1, 1, 4) == 1);          // 0.25f stage
+
+    // look-ahead (v2.89)
+    CHECK(UNLIMITED_LOOKAHEAD_TICKS == 128 * 4);                             // 128 frames at 60 fps
+    CHECK(lookAheadTicks(false, 130, 512) == 130);                           // off: normal look-ahead
+    CHECK(lookAheadTicks(false, 48, 512) == 48);
+    CHECK(lookAheadTicks(true, 130, 512) == 512);                            // cube / ball / spider
+    CHECK(lookAheadTicks(true, 65, 512) == 512);                             // wave
+    CHECK(lookAheadTicks(true, 48, 512) == 512);                             // ship / ufo / swing
+    CHECK(lookAheadTicks(true, 600, 512) == 600);                            // never shorter than the normal one
+    CHECK(lookAheadTicks(true, 130, 2048) == 2048);                          // st()-scaled (tps 960)
 
     // inverted wave detection
     FakePlayer p1, p2;
@@ -78,6 +89,7 @@ int main() {
 
     static_assert(passOrbPress(true, true, true, true), "constexpr");
     static_assert(maxDelayTicks(false, false, true, false, 1, 1, 4) == 24000, "constexpr");
+    static_assert(lookAheadTicks(true, 65, 512) == 512 && lookAheadTicks(false, 65, 512) == 65, "constexpr");
     std::printf(failures ? "FAILED (%d)\n" : "all prediction_policy tests passed\n", failures);
     return failures ? 1 : 0;
 }

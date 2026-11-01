@@ -12,6 +12,17 @@ namespace prediction_policy {
     // bounded by the prediction time budget; this only removes the stage's cap.
     constexpr int UNLIMITED_TICKS = 24000;
 
+    // v2.89: with "unlimited-delay" on, every mode (cube, ship, wave, ufo, ...) looks this far ahead:
+    // 128 frames at 60 fps = 512 ticks (the normal look-aheads are 130 ticks for cube / ball / spider,
+    // 65 for the wave and 48 for ship / ufo / swing). Callers pass st()-scaled values.
+    constexpr int UNLIMITED_LOOKAHEAD_TICKS = 512;
+
+    // Look-ahead (ticks) for a prediction: the normal one, or the extended one when unlimited-delay is
+    // on. Never shorter than the normal one, so a custom value above 128 frames still wins.
+    constexpr int lookAheadTicks(bool unlimited, int normal, int extended) {
+        return unlimited ? std::max(normal, extended) : normal;
+    }
+
     // A press that already touches an orb is the player's own orb hit: it goes to the game unchanged,
     // but never past a delay that is still waiting (that would reorder the inputs).
     constexpr bool passOrbPress(bool enabled, bool down, bool touchingOrb, bool queueEmpty) {
@@ -36,12 +47,13 @@ namespace prediction_policy {
     }
 
     // Longest delay in ticks (before st() scaling) for the mode being played. `unlimited` removes the
-    // stage's cap for cube / wave / etc.; the ship keeps its own limit (clamped 0..16) unless
-    // `shipUsesStage`, in which case it may also use the stage's delay (never less than its own).
+    // cap for every mode, ship included (v2.89; before, the ship kept its own 0..16 limit). Without it
+    // the ship keeps its own limit (clamped 0..16) unless `shipUsesStage`, in which case it may also use
+    // the stage's delay (never less than its own).
     constexpr int maxDelayTicks(bool anyWave, bool anyShip, bool unlimited, bool shipUsesStage, int stageAll, int stageWave, int shipMax) {
         int all = unlimited ? UNLIMITED_TICKS : stageAll;
         int wave = unlimited ? UNLIMITED_TICKS : stageWave;
-        int ship = std::clamp(shipMax, 0, 16);
+        int ship = unlimited ? UNLIMITED_TICKS : std::clamp(shipMax, 0, 16);
         if (shipUsesStage) {
             ship = std::max(ship, all);
         }
