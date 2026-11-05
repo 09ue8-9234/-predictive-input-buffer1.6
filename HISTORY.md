@@ -1,5 +1,10 @@
 # History
 
+## v2.88.5
+The black live-console window is off by default and really opens and closes. Every `src/` change:
+- `cfg.hpp`: `console-window` now defaults to OFF (it was ON). A `config.json` written by an older version still holds `true`, so switch it off once (Shift+F5 in the game, or the Testing app) and it stays off;
+- `main.cpp`: the mod no longer opens a console window at startup. `applyConsoleSettings()` opens it with `AllocConsole` when the setting is on and closes it with `FreeConsole` when it is off, instead of only hiding it (hiding did nothing visible when Windows Terminal is the default terminal). If the game already has a console of its own (Geode's), that one is only hidden / shown. The log writer thread gets lines only while the window is on; the pipe (the app's live view) and the F8 export always get them.
+
 ## v2.88.4 (Testing app 1.0.1)
 The practice-mode rule is removed (personal use only), and key bindings in config.json are loaded correctly. Every `src/` change:
 - `cfg.hpp`: removed the settings `practice-only` (and its Shift+F10 toggle key), `auto-release-normal-runs` and `fix-practice-queue`. Old keys in config.json are ignored and dropped at the next save; config-version stays 3.

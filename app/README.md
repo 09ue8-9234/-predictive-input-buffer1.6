@@ -9,7 +9,7 @@ GitHub -> Actions -> latest run of "Build Testing App" -> artifact **Testing App
 1. First start: it looks for `...\Geometry Dash\geode\config\abhyu.input-buffer\` (Steam). If it can't find it, "Browse..." and pick your Geometry Dash folder. The choice is remembered (`%AppData%\Testing\app.json`).
 2. **Game closed**: change anything; it is saved by itself (about a second after the last change) after a backup `config.app-backup-<time>.json`. Start the game afterwards.
 3. **Game running**: file editing is locked (the game would overwrite it). Press **Connect to game** (top right) to change things live over the console link; the file is not touched, the game saves its own changes. Only one client can use the link at a time: close `tools/pipe-test.ps1` first.
-4. **Console link** switch (top right) = the `console-link` setting. In the game: Ctrl+F5 (link) and Shift+F5 (console window). If the link is off while the game runs, only that key brings it back.
+4. **Console link** switch (top right) = the `console-link` setting. In the game: Ctrl+F5 (link) and Shift+F5 (the black console window: off by default, a real open / close). If the link is off while the game runs, only that key brings it back.
 
 ## Where the settings come from
 Nothing is listed inside the app. It reads the mod's own schema: `schema.json` written by the mod next to `config.json` (matches the installed mod), else the copy generated from `src/cfg.hpp` by the build. A running game's schema wins while connected. `Assets/groups.json` only holds key patterns that decide the page a setting appears on; a setting without a rule shows under "More settings".

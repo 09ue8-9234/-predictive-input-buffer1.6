@@ -1,4 +1,4 @@
-// Testing (id abhyu.input-buffer) v2.88.4: Click Before Frames engine, no in-game UI. All settings live in config.json (cfg.hpp) and are driven from an external console over a named pipe.
+// Testing (id abhyu.input-buffer) v2.88.5: Click Before Frames engine, no in-game UI. All settings live in config.json (cfg.hpp) and are driven from an external console over a named pipe.
 //
 // When you click (or release, in wave / robot), a hidden "ghost" player is simulated
 // ahead with your input. If the ghost dies, the input is retried with 1..N ticks of
@@ -883,15 +883,47 @@ namespace {
     void applyConsoleSettings() {
         PipeServer::get().setEnabled(cfg::b("console-link"));
 #ifdef GEODE_IS_WINDOWS
-        static int applied = -1;
-        int want = cfg::b("console-window") ? 1 : 0;
-        if (want != applied) {
-            if (want == 0 || applied != -1) {
-                if (HWND window = GetConsoleWindow()) {
-                    ShowWindow(window, want ? SW_SHOWNA : SW_HIDE);
+        // v2.88.5: the black console window is a REAL window now. ON opens it (AllocConsole), OFF closes it
+        // (FreeConsole), so nothing is left hidden behind (hiding does nothing visible when Windows
+        // Terminal is the default terminal). Its close button is removed while it is open, because closing a
+        // console window would close Geometry Dash with it. If the game already has a console of its own
+        // (Geode's), it can't be closed from here: it is only hidden / shown. The log writer thread only
+        // gets lines while buf.console is on; the pipe (the Testing app) always gets them.
+        static bool owned = false;  // we opened it, so we may close it
+        bool want = cfg::b("console-window");
+        if (want != buf.console) {
+            if (want) {
+                if (!GetConsoleWindow()) {
+                    if (AllocConsole()) {
+                        owned = true;
+                        FILE* out = nullptr;
+                        freopen_s(&out, "CONOUT$", "w", stdout);
+                        SetConsoleTitleA("Testing - Live Console");
+                        if (HWND window = GetConsoleWindow()) {
+                            if (HMENU menu = GetSystemMenu(window, FALSE)) {
+                                DeleteMenu(menu, SC_CLOSE, MF_BYCOMMAND);
+                            }
+                        }
+                    }
+                }
+                else if (HWND window = GetConsoleWindow()) {
+                    ShowWindow(window, SW_SHOWNA);
+                }
+                buf.console = true;
+                ConsoleSink::get().start();
+            }
+            else {
+                buf.console = false;  // no more lines for the writer thread
+                if (owned) {
+                    FILE* out = nullptr;
+                    freopen_s(&out, "NUL", "w", stdout);  // late lines of the writer thread go nowhere
+                    FreeConsole();
+                    owned = false;
+                }
+                else if (HWND window = GetConsoleWindow()) {
+                    ShowWindow(window, SW_HIDE);
                 }
             }
-            applied = want;
         }
 #endif
     }
@@ -4489,24 +4521,8 @@ $on_mod(Loaded) {
     }
     readSettings();
     applyStage();
-#ifdef GEODE_IS_WINDOWS
-    // The live console is the only output: it opens with the game. Its close button is
-    // removed, because closing a console window would close Geometry Dash with it.
-    // (If the game already has a console, e.g. Geode's own, AllocConsole fails and the log
-    // simply goes to that one.)
-    if (AllocConsole()) {
-        FILE* out = nullptr;
-        freopen_s(&out, "CONOUT$", "w", stdout);
-        SetConsoleTitleA("Testing - Live Console");
-        if (HWND window = GetConsoleWindow()) {
-            if (HMENU menu = GetSystemMenu(window, FALSE)) {
-                DeleteMenu(menu, SC_CLOSE, MF_BYCOMMAND);
-            }
-        }
-    }
-    buf.console = true;
-    ConsoleSink::get().start();
-#endif
+    // v2.88.5: no console window is created here any more. applyConsoleSettings() opens it only if the
+    // 'console-window' setting is on (default off: the Testing app shows the live log).
     applyConsoleSettings();
     PipeServer::get().start();
     if (Loader::get()->isModLoaded("syzzi.click_between_frames")) {

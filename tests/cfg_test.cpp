@@ -324,6 +324,14 @@ int main() {
         }
     }
 
+    // v2.88.5: the black console window is off by default; the console link (the app's live view) stays on
+    {
+        auto const* w = cfg::findSpec("console-window");
+        auto const* l = cfg::findSpec("console-link");
+        CHECK(w != nullptr && w->kind == cfg::Kind::Bool && w->def == 0);
+        CHECK(l != nullptr && l->kind == cfg::Kind::Bool && l->def == 1);
+    }
+
     if (failures) {
         std::printf("%d check(s) failed\n", failures);
         return 1;
